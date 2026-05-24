@@ -1,0 +1,28 @@
+# @package _global_
+
+defaults:
+  - override /data: nuscenes_1cam224
+  - override /model: fastwam
+  - _self_
+
+# dataloading
+batch_size: 4
+num_workers: 4
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+# scheduler
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 5
+max_steps: null
+log_every: 10
+save_every: 1000
+# Eval is out of scope for this PR; push eval_every past any reasonable smoke-test horizon.
+eval_every: 10000000
+
+# training
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null

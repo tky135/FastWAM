@@ -277,3 +277,77 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             random_idx = np.random.randint(len(self))
             data = self._get(random_idx)
         return data
+
+
+if __name__ == "__main__":
+    # Quick standalone explorer for RobotVideoDataset (LIBERO / RoboTwin / etc.). Dumps
+    # video strips and prints raw action/proprio numbers so you can eyeball the dataset.
+    #
+    # Run from anywhere (paths resolved off __file__):
+    #     python src/fastwam/datasets/lerobot/robot_video_dataset.py
+    #     python src/fastwam/datasets/lerobot/robot_video_dataset.py --task robotwin_uncond_3cam_384_1e-4 --indices 0 10 50
+    import argparse
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+    from hydra.utils import instantiate
+    from PIL import Image
+
+    parser = argparse.ArgumentParser(description="Inspect RobotVideoDataset samples.")
+    parser.add_argument("--task", default="libero_uncond_2cam224_1e-4")
+    parser.add_argument("--split", default="train", choices=["train", "val"])
+    parser.add_argument("--indices", type=int, nargs="*", default=[0, 1, 2])
+    parser.add_argument("--out-dir", default="./tmp/lerobot_inspect")
+    args = parser.parse_args()
+
+    repo_root = Path(__file__).resolve().parents[4]
+    config_dir = str(repo_root / "configs")
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
+        cfg = compose(config_name="train", overrides=[f"task={args.task}"])
+
+    if args.split not in cfg.data:
+        raise SystemExit(
+            f"task={args.task} has no `data.{args.split}` block; available: {list(cfg.data)}"
+        )
+
+    ds = instantiate(cfg.data[args.split])
+    print(f"len({args.split}) = {len(ds)}")
+
+    processor = ds.lerobot_dataset.processor
+    action_key = processor.shape_meta["action"][0]["key"]
+    state_key = processor.shape_meta["state"][0]["key"]
+    norm_action = processor.normalizer.normalizers["action"][action_key]
+    norm_state = processor.normalizer.normalizers["state"][state_key]
+
+    for idx in args.indices:
+        if idx >= len(ds):
+            print(f"skip idx={idx} (>= len {len(ds)})")
+            continue
+        sample = ds[idx]
+        print(f"\n=== sample {idx} ===")
+        for k, v in sample.items():
+            if hasattr(v, "shape"):
+                line = f"  {k:14s} shape={tuple(v.shape)} dtype={v.dtype}"
+                if v.dtype.is_floating_point:
+                    line += f"  min={v.min().item():+.3f}  max={v.max().item():+.3f}"
+                print(line)
+            else:
+                preview = repr(v)
+                print(f"  {k:14s} {preview[:96]}")
+
+        action_raw = norm_action.backward(sample["action"].clone()).cpu().numpy()
+        proprio_raw = norm_state.backward(sample["proprio"].clone()).cpu().numpy()
+        print(f"  action_raw step0: {action_raw[0]}")
+        print(f"  action_raw step-1: {action_raw[-1]}")
+        print(f"  proprio_raw step0: {proprio_raw[0]}")
+
+        # Save horizontal strip of T_video frames
+        video = sample["video"].float().clamp(-1, 1)
+        frames = ((video + 1.0) * 127.5).byte().permute(1, 2, 3, 0).cpu().numpy()  # [T,H,W,C]
+        strip = np.concatenate(list(frames), axis=1)
+        Image.fromarray(strip).save(out_dir / f"sample_{idx:05d}_frames.png")
+
+    print(f"\nWrote outputs to {out_dir.resolve()}")
