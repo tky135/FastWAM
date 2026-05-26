@@ -55,6 +55,7 @@ def main() -> None:
         "context": ctx[0].detach().to(device="cpu", dtype=torch.bfloat16).contiguous(),
         "mask": mask[0].detach().to(device="cpu", dtype=torch.bool).contiguous(),
     }
+    import ipdb ; ipdb.set_trace()
     hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     out_path = CACHE_DIR / f"{hashed}.t5_len{CONTEXT_LEN}.wan22ti2v5b.pt"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)

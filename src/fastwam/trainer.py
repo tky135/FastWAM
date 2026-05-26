@@ -519,11 +519,23 @@ class Wan22Trainer:
             frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
             stitched_frames.append(Image.fromarray(frame))
 
-        video_path = os.path.join(
-            self.eval_dir,
-            f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.mp4",
-        )
+        step_tag = f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}"
+        video_path = os.path.join(self.eval_dir, f"{step_tag}.mp4")
         save_mp4(stitched_frames, video_path, fps=8)
+
+        # Optional domain-specific viz hook (e.g. nuScenes BEV trajectory plot).
+        # No-op for datasets that don't define `save_eval_visualization`.
+        domain_viz = getattr(self.val_dataset, "save_eval_visualization", None)
+        if callable(domain_viz) and action is not None and pred_action is not None:
+            try:
+                domain_viz(
+                    eval_dir=self.eval_dir,
+                    step_tag=step_tag,
+                    pred_action_denorm=pred_action_denorm[0],
+                    gt_action_denorm=gt_action_denorm[0],
+                )
+            except Exception as exc:
+                logger.warning(f"save_eval_visualization failed: {exc!r}")
 
         local_metrics = torch.tensor(
             [
@@ -643,6 +655,42 @@ class Wan22Trainer:
             state_file,
         )
 
+    def _run_eval_and_log(self):
+        """Run one eval pass and log metrics to stdout + wandb. Safe to call whenever
+        an eval cycle should fire (also used for the pre-training baseline eval)."""
+        if self.val_dataset is None:
+            return
+        metrics = self.evaluate()
+        self.accelerator.wait_for_everyone()
+        if metrics is None or not self.accelerator.is_main_process:
+            return
+
+        description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
+            self.global_step,
+            metrics["val_loss"],
+            metrics["psnr_rd"],
+            metrics["ssim_rd"],
+        )
+        if "action_l2" in metrics:
+            description += " action_l2=%.4f" % metrics["action_l2"]
+        if "action_l1" in metrics:
+            description += " action_l1=%.4f" % metrics["action_l1"]
+        logger.info(description)
+        eval_payload = {
+            "eval/val_loss": float(metrics["val_loss"]),
+            "eval/psnr_rg": float(metrics["psnr_rg"]),
+            "eval/ssim_rg": float(metrics["ssim_rg"]),
+            "eval/psnr_rd": float(metrics["psnr_rd"]),
+            "eval/ssim_rd": float(metrics["ssim_rd"]),
+            "eval/psnr_dg": float(metrics["psnr_dg"]),
+            "eval/ssim_dg": float(metrics["ssim_dg"]),
+        }
+        if "action_l2" in metrics:
+            eval_payload["eval/action_l2"] = float(metrics["action_l2"])
+        if "action_l1" in metrics:
+            eval_payload["eval/action_l1"] = float(metrics["action_l1"])
+        self._wandb_log(eval_payload)
+
     def train(self):
         self._set_dit_only_train_mode()
 
@@ -652,6 +700,15 @@ class Wan22Trainer:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")
 
         logger.info("Starting training with max_steps=%d.", self.max_steps)
+
+        # Baseline eval at step 0 (before any optimizer step) so you can see the
+        # untrained-model metrics and confirm the eval pipeline works before
+        # committing wall-clock time to training.
+        if self.eval_every > 0 and self.val_dataset is not None and self.global_step == 0:
+            logger.info("Running baseline eval before training (step=0)...")
+            self._run_eval_and_log()
+            self.accelerator.wait_for_everyone()
+
         data_iter = iter(self.train_loader)
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
@@ -730,34 +787,7 @@ class Wan22Trainer:
                         and self.val_dataset is not None
                         and self.global_step % self.eval_every == 0
                     ):
-                        metrics = self.evaluate()
-                        self.accelerator.wait_for_everyone()
-                        if metrics is not None and self.accelerator.is_main_process:
-                            description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
-                                self.global_step,
-                                metrics["val_loss"],
-                                metrics["psnr_rd"],
-                                metrics["ssim_rd"],
-                            )
-                            if "action_l2" in metrics:
-                                description += " action_l2=%.4f" % metrics["action_l2"]
-                            if "action_l1" in metrics:
-                                description += " action_l1=%.4f" % metrics["action_l1"]
-                            logger.info(description)
-                            eval_payload = {
-                                "eval/val_loss": float(metrics["val_loss"]),
-                                "eval/psnr_rg": float(metrics["psnr_rg"]),
-                                "eval/ssim_rg": float(metrics["ssim_rg"]),
-                                "eval/psnr_rd": float(metrics["psnr_rd"]),
-                                "eval/ssim_rd": float(metrics["ssim_rd"]),
-                                "eval/psnr_dg": float(metrics["psnr_dg"]),
-                                "eval/ssim_dg": float(metrics["ssim_dg"]),
-                            }
-                            if "action_l2" in metrics:
-                                eval_payload["eval/action_l2"] = float(metrics["action_l2"])
-                            if "action_l1" in metrics:
-                                eval_payload["eval/action_l1"] = float(metrics["action_l1"])
-                            self._wandb_log(eval_payload)
+                        self._run_eval_and_log()
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
                         ckpt_info = self.save_checkpoint()

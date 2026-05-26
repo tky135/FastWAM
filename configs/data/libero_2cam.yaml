@@ -65,3 +65,4 @@ train:
         size: [224, 224]
   text_embedding_cache_dir: ./data/text_embeds_cache/libero
   context_len: 128
+  pretrained_norm_stats: null

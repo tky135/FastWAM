@@ -315,6 +315,8 @@ if __name__ == "__main__":
 
     ds = instantiate(cfg.data[args.split])
     print(f"len({args.split}) = {len(ds)}")
+    
+    import ipdb ; ipdb.set_trace()
 
     processor = ds.lerobot_dataset.processor
     action_key = processor.shape_meta["action"][0]["key"]

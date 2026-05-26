@@ -135,6 +135,7 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
                     logger.info("Computing nuScenes dataset stats for normalization...")
                     dataset_stats = self._compute_dataset_stats(processor)
                     work_dir = misc.get_work_dir() or "."
+                    os.makedirs(work_dir, exist_ok=True)
                     save_dataset_stats_to_json(
                         dataset_stats, os.path.join(work_dir, "dataset_stats.json")
                     )
@@ -147,11 +148,18 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
             else:
                 dataset_stats = load_dataset_stats_from_json(pretrained_norm_stats)
                 logger.info(f"Loaded nuScenes dataset stats: {pretrained_norm_stats}")
+                # Mirror into work_dir only if the source path is different — otherwise
+                # rank 0's re-write races with rank N's read on the same file and
+                # corrupts the JSON for the slow reader. See the runtime.build_datasets
+                # path: pretrained_norm_stats for val is exactly work_dir/dataset_stats.json,
+                # which makes the re-save pure redundancy. Skipping it eliminates the race.
                 if PartialState().is_main_process:
                     work_dir = misc.get_work_dir() or "."
-                    save_dataset_stats_to_json(
-                        dataset_stats, os.path.join(work_dir, "dataset_stats.json")
-                    )
+                    target_path = os.path.realpath(os.path.join(work_dir, "dataset_stats.json"))
+                    source_path = os.path.realpath(pretrained_norm_stats)
+                    if source_path != target_path:
+                        os.makedirs(work_dir, exist_ok=True)
+                        save_dataset_stats_to_json(dataset_stats, target_path)
 
             processor.set_normalizer_from_stats(dataset_stats)
             if is_training_set:
@@ -168,24 +176,38 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
 
     def _resolve_split_scenes(self, version: str, split: str, create_splits_scenes) -> list[str]:
         all_splits = create_splits_scenes()
-        if version.endswith("mini"):
-            key = "mini_train" if split == "train" else "mini_val"
+        is_mini_version = version.endswith("mini")
+        if split == "mini":
+            # Combined v1.0-mini set: mini_train + mini_val (no internal train/val split).
+            wanted = set(all_splits.get("mini_train", [])) | set(all_splits.get("mini_val", []))
+            resolved = "mini_train+mini_val"
+        elif split in all_splits:
+            # Direct nuScenes split key, e.g. "mini_train", "mini_val", "test".
+            wanted = set(all_splits[split])
+            resolved = split
+        elif split == "train":
+            resolved = "mini_train" if is_mini_version else "train"
+            wanted = set(all_splits[resolved])
+        elif split == "val":
+            resolved = "mini_val" if is_mini_version else "val"
+            wanted = set(all_splits[resolved])
         else:
-            key = "train" if split == "train" else "val"
-        if key not in all_splits:
             raise ValueError(
-                f"Split '{key}' not found in nuscenes splits. Available: {list(all_splits)}"
+                f"Unknown split '{split}'. Known: {sorted(all_splits)} + 'mini' alias."
             )
-        wanted = set(all_splits[key])
         present = {s["name"]: s["token"] for s in self.nusc.scene}
         scene_names = sorted(wanted & set(present.keys()))
         if not scene_names:
             raise RuntimeError(
-                f"No scenes from split '{key}' present in dataroot '{self.dataroot}'."
+                f"No scenes from split '{resolved}' present in dataroot '{self.dataroot}'."
             )
         return scene_names
 
     def _build_sample_index(self, scene_names: list[str]) -> list[str]:
+        # Anchors must have at least ONE prior keyframe in the same scene so that
+        # `_compute_proprio` can compute the anchor's velocity by backward-differencing
+        # against the previous frame (avoiding a future leak — see _compute_proprio).
+        # Hence the range starts at 1, not 0. Each scene loses one candidate anchor.
         anchors: list[str] = []
         for s in self.nusc.scene:
             if s["name"] not in scene_names:
@@ -196,9 +218,9 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
                 tokens.append(tok)
                 tok = self.nusc.get("sample", tok)["next"]
             max_anchor = len(tokens) - self.num_frames + 1
-            if max_anchor <= 0:
+            if max_anchor <= 1:
                 continue
-            for i in range(0, max_anchor, self.global_sample_stride):
+            for i in range(1, max_anchor, self.global_sample_stride):
                 anchors.append(tokens[i])
         return anchors
 
@@ -264,31 +286,48 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
 
     def _compute_proprio(
         self,
-        translations: np.ndarray,
-        rotations: np.ndarray,
-        samples: list[dict],
+        translations: np.ndarray,        # [T, 3], window keyframes 0..T-1
+        rotations: np.ndarray,           # [T, 4], window keyframes 0..T-1
+        samples: list[dict],             # length T, window keyframes 0..T-1
+        prev_translation: np.ndarray,    # [3], the keyframe immediately before window[0]
+        prev_rotation: np.ndarray,       # [4], same
+        prev_timestamp_us: float,        # microseconds, same
     ) -> torch.Tensor:
+        """Compute per-step ego dynamics using BACKWARD differencing.
+
+        For each window step k in 0..T-1, the velocity at window-time k uses positions
+        at window-times k-1 and k (where k-1=-1 means the prior keyframe). This avoids
+        leaking future positions into the proprio conditioning — a model that sees
+        proprio[k] cannot trivially recover the unseen position at window-time k+1.
+        """
         T = translations.shape[0]
-        timestamps_us = np.asarray([s["timestamp"] for s in samples], dtype=np.float64)
-        dt = (timestamps_us[1:] - timestamps_us[:-1]) * 1e-6  # [T-1]
-        dt = np.where(dt <= 1e-6, 1e-3, dt)  # guard against zero
+        # Extend by one step into the past so window step 0 has a valid backward neighbor.
+        ext_translations = np.vstack([prev_translation[None, :], translations])  # [T+1, 3]
+        ext_rotations = np.vstack([prev_rotation[None, :], rotations])           # [T+1, 4]
+        ext_timestamps_us = np.concatenate(
+            [[prev_timestamp_us], np.asarray([s["timestamp"] for s in samples], dtype=np.float64)]
+        )                                                                        # [T+1]
 
-        yaws = self._yaw_from_quat(rotations)
+        # dt[k] = window-time-k timestamp minus window-time-(k-1) timestamp, in seconds.
+        dt_back = (ext_timestamps_us[1:] - ext_timestamps_us[:-1]) * 1e-6        # [T]
+        dt_back = np.where(dt_back <= 1e-6, 1e-3, dt_back)  # guard against zero/dup timestamps
 
-        v_world = np.zeros((T, 2), dtype=np.float64)
-        v_world[:-1, 0] = (translations[1:, 0] - translations[:-1, 0]) / dt
-        v_world[:-1, 1] = (translations[1:, 1] - translations[:-1, 1]) / dt
-        v_world[-1] = v_world[-2]  # backward diff for last step
+        # World-frame velocity at window-time k, via backward diff.
+        v_world_x = (ext_translations[1:, 0] - ext_translations[:-1, 0]) / dt_back  # [T]
+        v_world_y = (ext_translations[1:, 1] - ext_translations[:-1, 1]) / dt_back  # [T]
 
+        # Rotate into the ego frame *at* window-time k (not k-1) — proprio is "your
+        # current velocity expressed in your current heading".
+        yaws = self._yaw_from_quat(rotations)                                       # [T]
         cos_y = np.cos(-yaws)
         sin_y = np.sin(-yaws)
-        v_x = cos_y * v_world[:, 0] - sin_y * v_world[:, 1]
-        v_y = sin_y * v_world[:, 0] + cos_y * v_world[:, 1]
+        v_x = cos_y * v_world_x - sin_y * v_world_y
+        v_y = sin_y * v_world_x + cos_y * v_world_y
         speed = np.sqrt(v_x * v_x + v_y * v_y)
 
-        yaw_rate = np.zeros(T, dtype=np.float64)
-        yaw_rate[:-1] = _wrap_to_pi(yaws[1:] - yaws[:-1]) / dt
-        yaw_rate[-1] = yaw_rate[-2]
+        # Yaw-rate at window-time k, also via backward diff.
+        ext_yaws = self._yaw_from_quat(ext_rotations)                               # [T+1]
+        yaw_rate = _wrap_to_pi(ext_yaws[1:] - ext_yaws[:-1]) / dt_back              # [T]
 
         proprio = np.stack([v_x, v_y, yaw_rate, speed], axis=-1).astype(np.float32)
         return torch.from_numpy(proprio)
@@ -296,13 +335,32 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
     def _build_raw_sample(self, idx: int) -> dict:
         anchor_token = self.sample_tokens[idx]
         samples = self._walk_forward_keyframes(anchor_token, self.num_frames)
+        # Backward-diff proprio needs one keyframe before the anchor. The index builder
+        # guarantees anchor index >= 1 within the scene, so anchor["prev"] is always set.
+        anchor_sample = samples[0]
+        prev_tok = anchor_sample["prev"]
+        assert prev_tok, (
+            f"anchor {anchor_token} unexpectedly has no prev keyframe; "
+            "the sample index should not include scene-first keyframes."
+        )
+        prev_sample = self.nusc.get("sample", prev_tok)
+        prev_translation, prev_rotation = self._get_ego_pose(prev_sample)
+        prev_timestamp_us = float(prev_sample["timestamp"])
+
         imgs = torch.stack(
             [self._load_front_image(s) for s in samples], dim=0
         )  # [T, 3, H, W] uint8
         translations = np.stack([self._get_ego_pose(s)[0] for s in samples], axis=0)
         rotations = np.stack([self._get_ego_pose(s)[1] for s in samples], axis=0)
         actions = self._compute_waypoints(translations, rotations)  # [T-1, 3]
-        proprio = self._compute_proprio(translations, rotations, samples)  # [T, 4]
+        proprio = self._compute_proprio(
+            translations,
+            rotations,
+            samples,
+            prev_translation=prev_translation,
+            prev_rotation=prev_rotation,
+            prev_timestamp_us=prev_timestamp_us,
+        )  # [T, 4]
 
         T = self.num_frames
         return {
@@ -319,12 +377,29 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
     # ---- stats ----
 
     def _compute_dataset_stats(self, processor) -> dict:
+        """One-pass scan over every anchor sample, producing the normalization stats dict
+        that ``FastWAMProcessor.set_normalizer_from_stats`` consumes.
+
+        The schema (per-key ``global_*`` and ``stepwise_*`` for min/max/mean/std/q01/q99,
+        plus top-level ``num_episodes`` / ``num_transition``) mirrors
+        ``BaseLerobotDataset.get_dataset_stats`` so the same JSON serializer and
+        ``LinearNormalizer`` can read it. The normalizer's ``norm_default_mode`` decides
+        which two of those stats are actually used at runtime (z-score → mean/std,
+        min/max → global_min/max, q01/q99 → global_q01/q99).
+        """
         from tqdm import tqdm
 
+        # We collect raw action and state tensors here. We do NOT touch the normalizer
+        # (it doesn't exist yet — its construction is what these stats feed into).
         action_list: list[torch.Tensor] = []
         state_list: list[torch.Tensor] = []
         for i in tqdm(range(len(self)), desc="nuScenes stats pass"):
             raw = self._build_raw_sample(i)
+            # Apply only the processor's `action_state_transform` step. This validates
+            # shape_meta and runs any configured action/state transforms — but does NOT
+            # normalize or merge keys. We want stats over the same values the runtime
+            # normalizer will see (post-transform, pre-normalize), so this stays in sync
+            # if you ever add e.g. a delta-action transform.
             transformed = processor.action_state_transform(
                 {
                     "action": {k: v.clone() for k, v in raw["action"].items()},
@@ -334,17 +409,25 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
             action_list.append(transformed["action"][self._action_key])
             state_list.append(transformed["state"][self._state_key])
 
+        # Stack across samples → [N, T_horizon, dim]. "stepwise" reductions keep the
+        # timestep axis (T_horizon, dim); "global" reductions flatten across samples AND
+        # timesteps to give just (dim,).
         action = torch.stack(action_list, dim=0)  # [N, T-1, A]
         state = torch.stack(state_list, dim=0)  # [N, T, S]
 
         def _per_key_stats(data: torch.Tensor) -> dict:
+            # data: [N, T_horizon, dim]
             data = data.float()
+            # Stepwise: reduce over the sample axis only. Shape (T_horizon, dim).
+            # Used when norm mode is configured as "stepwise" — one scale/offset per timestep.
             stepwise_min = data.amin(dim=0)
             stepwise_max = data.amax(dim=0)
             stepwise_mean = data.mean(dim=0)
             stepwise_std = data.std(dim=0, unbiased=False)
             stepwise_q01 = torch.quantile(data, 0.01, dim=0)
             stepwise_q99 = torch.quantile(data, 0.99, dim=0)
+            # Global: collapse samples + timesteps. Shape (dim,). The standard path
+            # (z-score / min-max with `use_stepwise_action_norm: false`) uses these.
             flat = data.reshape(-1, data.shape[-1])
             global_min = flat.amin(dim=0)
             global_max = flat.amax(dim=0)
@@ -433,14 +516,35 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
         image_is_pad = image_is_pad[self.video_sample_indices]
 
         return {
+            # Front-camera video clip. [C=3, T_video=9, H=224, W=400], float32 in [-1, 1].
+            # Frame 0 is the anchor (current observation); frames 1..8 are 0.5 s apart.
             "video": video,
+            # Future ego trajectory: 8 cumulative waypoints from the anchor, in its ego
+            # frame. Each row is (Δx forward, Δy left, Δyaw CCW), z-score normalized.
+            # This is the model's prediction target.
             "action": sample["action"],
+            # Current ego dynamics conditioning. [T_action=8, 4] = (v_x, v_y, yaw_rate,
+            # speed), z-score normalized. Model only consumes row 0 (the anchor's
+            # state); higher rows are present for API parity with LIBERO/RoboTwin.
             "proprio": sample["proprio"][:-1, :],
+            # Final templated prompt string — the literal text that was T5-encoded into
+            # `context`. Same value for every nuScenes sample (single fixed prompt).
             "prompt": instruction,
+            # Pre-computed UMT5-XXL text embedding of `prompt`. [context_len=128, 4096]
+            # bf16. Cross-attended by the video DiT. Constant across all samples.
             "context": context,
+            # Attention mask for `context`. Always all-True after the Wan2.2 convention
+            # of zeroing padded positions instead of masking them out (see `_get`).
             "context_mask": context_mask,
+            # Per-video-frame padding flag. [T_video=9], bool. All-False here because
+            # the index builder only keeps anchors whose 9-frame window is fully inside
+            # one scene. The model uses it to skip loss on padded frames.
             "image_is_pad": image_is_pad,
+            # Per-action-step padding flag. [T_action=8], bool. All-False for the same
+            # reason. Masks the action regression loss at padded steps.
             "action_is_pad": sample["action_is_pad"],
+            # Per-proprio-step padding flag. [T=9], bool. Length intentionally asymmetric
+            # with `proprio` (which is [:-1, :]) — mirrors RobotVideoDataset's behavior.
             "proprio_is_pad": sample["proprio_is_pad"],
         }
 
@@ -451,6 +555,98 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
             print(f"Error processing nuScenes sample idx {idx}: {exc}")
             print(traceback.format_exc())
             return self._get(int(np.random.randint(len(self))))
+
+    # ---- eval-time visualization hook ----
+
+    def save_eval_visualization(
+        self,
+        eval_dir: str,
+        step_tag: str,
+        pred_action_denorm,
+        gt_action_denorm,
+    ) -> Optional[str]:
+        """Driving-specific eval visualization hook called by `Wan22Trainer.evaluate()`.
+
+        Receives already-denormalized predicted and ground-truth ego trajectories of shape
+        ``[T_action, 3]`` (rows are anchor-frame waypoints in metres / radians) and writes
+        a BEV trajectory plot to ``{eval_dir}/{step_tag}_bev.png``. Also reports ADE/FDE/
+        yaw error in the figure title so you can read the metric off the file without
+        opening it programmatically.
+
+        Returns the output path or ``None`` if matplotlib is unavailable.
+        """
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            return None
+
+        def _to_np(t):
+            if hasattr(t, "detach"):
+                t = t.detach()
+            if hasattr(t, "cpu"):
+                t = t.cpu()
+            if hasattr(t, "numpy"):
+                t = t.numpy()
+            return np.asarray(t, dtype=np.float64)
+
+        pred = _to_np(pred_action_denorm).reshape(-1, 3)
+        gt = _to_np(gt_action_denorm).reshape(-1, 3)
+        if pred.shape != gt.shape:
+            raise ValueError(
+                f"pred/gt action shape mismatch: pred={pred.shape}, gt={gt.shape}"
+            )
+
+        # BEV in driving convention: forward = up (+y axis), right = +x axis.
+        # Anchor ego frame uses +x forward, +y left; we plot (-dy, dx) and prepend the
+        # anchor (0, 0) so the curve starts at the ego origin.
+        def _to_bev(action: np.ndarray):
+            xs = np.concatenate([[0.0], -action[:, 1]])
+            ys = np.concatenate([[0.0], action[:, 0]])
+            yaws = np.concatenate([[0.0], action[:, 2]])
+            return xs, ys, yaws
+
+        pred_xs, pred_ys, pred_yaws = _to_bev(pred)
+        gt_xs, gt_ys, gt_yaws = _to_bev(gt)
+
+        # Metrics, in physical units (m / rad).
+        step_l2 = np.linalg.norm(pred[:, :2] - gt[:, :2], axis=-1)  # [T]
+        ade = float(step_l2.mean()) if step_l2.size > 0 else 0.0
+        fde = float(step_l2[-1]) if step_l2.size > 0 else 0.0
+        yaw_err = float(np.abs(_wrap_to_pi(pred[:, 2] - gt[:, 2])).mean()) if pred.size > 0 else 0.0
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.plot(gt_xs, gt_ys, marker="o", color="C2", label="ground truth", linewidth=2)
+        ax.plot(pred_xs, pred_ys, marker="x", color="C0", label="predicted", linewidth=2, linestyle="--")
+        for x, y, yaw in zip(pred_xs, pred_ys, pred_yaws):
+            ax.arrow(
+                x, y, 0.4 * np.sin(yaw), 0.4 * np.cos(yaw),
+                head_width=0.2, length_includes_head=True, color="C0", alpha=0.5,
+            )
+        for x, y, yaw in zip(gt_xs, gt_ys, gt_yaws):
+            ax.arrow(
+                x, y, 0.4 * np.sin(yaw), 0.4 * np.cos(yaw),
+                head_width=0.2, length_includes_head=True, color="C2", alpha=0.5,
+            )
+        ax.axhline(0, color="0.7", lw=0.5)
+        ax.axvline(0, color="0.7", lw=0.5)
+        ax.set_aspect("equal")
+        ax.set_xlabel("right (m)")
+        ax.set_ylabel("forward (m)")
+        ax.set_title(
+            f"{step_tag}\nADE={ade:.2f} m   FDE={fde:.2f} m   yaw_err={yaw_err:.3f} rad"
+        )
+        ax.legend(loc="upper left", fontsize=9)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+
+        os.makedirs(eval_dir, exist_ok=True)
+        out_path = os.path.join(eval_dir, f"{step_tag}_bev.png")
+        fig.savefig(out_path, dpi=110)
+        plt.close(fig)
+        return out_path
 
 
 if __name__ == "__main__":
@@ -468,7 +664,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Inspect NuScenesVideoDataset samples.")
     parser.add_argument("--task", default="nuscenes_uncond_1cam224_1e-4")
-    parser.add_argument("--split", default="train", choices=["train", "val"])
+    parser.add_argument(
+        "--split",
+        default="train",
+        choices=["train", "val", "mini"],
+        help="train/val auto-map to mini_train/mini_val when version=v1.0-mini; "
+             "mini = all v1.0-mini scenes combined (no inner train/val split).",
+    )
     parser.add_argument("--indices", type=int, nargs="*", default=[0, 1, 2])
     parser.add_argument("--out-dir", default="./tmp/nuscenes_inspect")
     args = parser.parse_args()

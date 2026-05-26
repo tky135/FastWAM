@@ -1,6 +1,6 @@
 train:
   _target_: fastwam.datasets.nuscenes.nuscenes_video_dataset.NuScenesVideoDataset
-  dataroot: ${oc.env:NUSCENES_DATAROOT,./data/nuscenes}
+  dataroot: /root/autodl-fs/nuscenes
   version: v1.0-mini
   split: train
   camera_key: CAM_FRONT
@@ -8,7 +8,7 @@ train:
     images:
       - key: CAM_FRONT
         raw_shape: [3, 900, 1600]
-        shape: [3, 224, 400]
+        shape: [3, 224, 384]
     action:
       - key: default
         raw_shape: 3   # (dx, dy, dyaw) in anchor ego frame
@@ -19,7 +19,7 @@ train:
         shape: 4
   num_frames: 9
   action_video_freq_ratio: 1     # T_video=9, T_action=8; 4s window at 2 Hz keyframes
-  video_size: [224, 400]         # final dataset-level resize/crop, both divisible by 16
+  video_size: [224, 384]         # final dataset-level resize/crop, both divisible by 16
   global_sample_stride: 1
   is_training_set: true
   skip_padding_as_possible: false
@@ -41,18 +41,18 @@ train:
     train_transforms:
       - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
-        size: [224, 400]
+        size: [224, 384]
     val_transforms:
       - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
-        size: [224, 400]
+        size: [224, 384]
   text_embedding_cache_dir: ./data/text_embeds_cache/nuscenes
   context_len: 128
 
 val:
   _target_: fastwam.datasets.nuscenes.nuscenes_video_dataset.NuScenesVideoDataset
-  dataroot: ${oc.env:NUSCENES_DATAROOT,./data/nuscenes}
-  version: ${data.train.version}
+  dataroot: /root/autodl-fs/nuscenes
+  version: v1.0-mini
   split: val
   camera_key: ${data.train.camera_key}
   shape_meta: ${data.train.shape_meta}
@@ -67,3 +67,25 @@ val:
   text_embedding_cache_dir: ${data.train.text_embedding_cache_dir}
   context_len: ${data.train.context_len}
   pretrained_norm_stats: null   # runtime.build_datasets passes the actual path at instantiate time
+
+# Convenience block: combined mini_train + mini_val (all 10 v1.0-mini scenes), used as a
+# single dataset. Mirrors `train` so stats are computed on first init. Useful for the
+# dataset explorer (`--split mini`) and for tiny smoke runs where train/val split would
+# leave you with only 2 val scenes.
+mini:
+  _target_: fastwam.datasets.nuscenes.nuscenes_video_dataset.NuScenesVideoDataset
+  dataroot: /root/autodl-fs/nuscenes
+  version: v1.0-mini
+  split: mini
+  camera_key: ${data.train.camera_key}
+  shape_meta: ${data.train.shape_meta}
+  num_frames: ${data.train.num_frames}
+  action_video_freq_ratio: ${data.train.action_video_freq_ratio}
+  video_size: ${data.train.video_size}
+  global_sample_stride: 1
+  is_training_set: true
+  skip_padding_as_possible: false
+  override_instruction: ${data.train.override_instruction}
+  processor: ${data.train.processor}
+  text_embedding_cache_dir: ${data.train.text_embedding_cache_dir}
+  context_len: ${data.train.context_len}
