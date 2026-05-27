@@ -1,7 +1,7 @@
 train:
   _target_: fastwam.datasets.nuscenes.nuscenes_video_dataset.NuScenesVideoDataset
-  dataroot: /root/autodl-fs/nuscenes
-  version: v1.0-mini
+  dataroot: /root/autodl-tmp/nuscenes
+  version: v1.0-trainval
   split: train
   camera_key: CAM_FRONT
   shape_meta:
@@ -51,9 +51,9 @@ train:
 
 val:
   _target_: fastwam.datasets.nuscenes.nuscenes_video_dataset.NuScenesVideoDataset
-  dataroot: /root/autodl-fs/nuscenes
-  version: v1.0-mini
-  split: val
+  dataroot: /root/autodl-tmp/nuscenes
+  version: v1.0-test
+  split: test
   camera_key: ${data.train.camera_key}
   shape_meta: ${data.train.shape_meta}
   num_frames: ${data.train.num_frames}

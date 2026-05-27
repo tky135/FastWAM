@@ -617,22 +617,45 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
         fde = float(step_l2[-1]) if step_l2.size > 0 else 0.0
         yaw_err = float(np.abs(_wrap_to_pi(pred[:, 2] - gt[:, 2])).mean()) if pred.size > 0 else 0.0
 
-        fig, ax = plt.subplots(figsize=(6, 6))
-        ax.plot(gt_xs, gt_ys, marker="o", color="C2", label="ground truth", linewidth=2)
-        ax.plot(pred_xs, pred_ys, marker="x", color="C0", label="predicted", linewidth=2, linestyle="--")
-        for x, y, yaw in zip(pred_xs, pred_ys, pred_yaws):
-            ax.arrow(
-                x, y, 0.4 * np.sin(yaw), 0.4 * np.cos(yaw),
-                head_width=0.2, length_includes_head=True, color="C0", alpha=0.5,
-            )
+        # Two-tone palette per series: a lighter shade for the connecting line, a darker
+        # shade for the markers and heading arrows. Makes the relationship between waypoints
+        # and arrows visually clear without losing the pred/gt distinction.
+        GT_DARK = "#1b7a32"      # markers + arrows
+        GT_LINE = "#6dbc7e"      # connector line (lighter green)
+        PRED_DARK = "#6a1b9a"    # markers + arrows
+        PRED_LINE = "#b388d6"    # connector line (lighter purple)
+
+        fig, ax = plt.subplots(figsize=(6, 7))
+
+        # Connector lines (lighter shades).
+        ax.plot(gt_xs, gt_ys, color=GT_LINE, linewidth=2.5, zorder=2)
+        ax.plot(pred_xs, pred_ys, color=PRED_LINE, linewidth=2.5, linestyle="--", zorder=2)
+
+        # Waypoint markers (darker shades, on top of the lines).
+        ax.scatter(gt_xs, gt_ys, color=GT_DARK, marker="o", s=55,
+                   zorder=5, label="ground truth", edgecolors="white", linewidths=0.8)
+        ax.scatter(pred_xs, pred_ys, color=PRED_DARK, marker="X", s=75,
+                   zorder=5, label="predicted", edgecolors="white", linewidths=0.8)
+
+        # Heading arrows (darker shades, matching the markers).
         for x, y, yaw in zip(gt_xs, gt_ys, gt_yaws):
             ax.arrow(
-                x, y, 0.4 * np.sin(yaw), 0.4 * np.cos(yaw),
-                head_width=0.2, length_includes_head=True, color="C2", alpha=0.5,
+                x, y, 0.5 * np.sin(yaw), 0.5 * np.cos(yaw),
+                head_width=0.25, length_includes_head=True, color=GT_DARK, alpha=0.85, zorder=4,
             )
+        for x, y, yaw in zip(pred_xs, pred_ys, pred_yaws):
+            ax.arrow(
+                x, y, 0.5 * np.sin(yaw), 0.5 * np.cos(yaw),
+                head_width=0.25, length_includes_head=True, color=PRED_DARK, alpha=0.85, zorder=4,
+            )
+
         ax.axhline(0, color="0.7", lw=0.5)
         ax.axvline(0, color="0.7", lw=0.5)
-        ax.set_aspect("equal")
+        # `adjustable="box"` makes matplotlib resize the axes box to honor the aspect
+        # ratio, so the xlim/ylim we set below are honored exactly. With the default
+        # `adjustable="datalim"` matplotlib would expand the data range instead, which
+        # is fine for visibility but breaks "the viewport is what I asked for".
+        ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel("right (m)")
         ax.set_ylabel("forward (m)")
         ax.set_title(
@@ -640,8 +663,32 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
         )
         ax.legend(loc="upper left", fontsize=9)
         ax.grid(True, alpha=0.3)
-        fig.tight_layout()
 
+        # Fixed viewport (in meters) for visual consistency across eval steps. Only
+        # expand the bounds if any waypoint (or its heading-arrow tip) would fall
+        # outside; an unusual sample with long trajectories or large lateral motion
+        # is never clipped. Defaults assume nuScenes urban driving: ~40 m forward over
+        # 4 s @ 10 m/s, ~10 m lateral on sharp turns.
+        DEFAULT_X = (-15.0, 15.0)
+        DEFAULT_Y = (-5.0, 40.0)
+        ARROW_REACH = 0.75   # arrow length (0.5) + head_width (0.25)
+        EDGE_PAD = 1.5       # breathing room past the arrow tip so nothing sits on the axis line
+
+        all_x = np.concatenate([pred_xs, gt_xs])
+        all_y = np.concatenate([pred_ys, gt_ys])
+        data_x_lo = float(all_x.min()) - ARROW_REACH - EDGE_PAD
+        data_x_hi = float(all_x.max()) + ARROW_REACH + EDGE_PAD
+        data_y_lo = float(all_y.min()) - ARROW_REACH - EDGE_PAD
+        data_y_hi = float(all_y.max()) + ARROW_REACH + EDGE_PAD
+
+        x_lo = min(DEFAULT_X[0], data_x_lo)
+        x_hi = max(DEFAULT_X[1], data_x_hi)
+        y_lo = min(DEFAULT_Y[0], data_y_lo)
+        y_hi = max(DEFAULT_Y[1], data_y_hi)
+        ax.set_xlim(x_lo, x_hi)
+        ax.set_ylim(y_lo, y_hi)
+
+        fig.tight_layout()
         os.makedirs(eval_dir, exist_ok=True)
         out_path = os.path.join(eval_dir, f"{step_tag}_bev.png")
         fig.savefig(out_path, dpi=110)
