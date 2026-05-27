@@ -48,6 +48,12 @@ train:
         size: [224, 384]
   text_embedding_cache_dir: ./data/text_embeds_cache/nuscenes
   context_len: 128
+  # When set, the normalization stats pass writes its result here on first run and
+  # loads from it on every subsequent run, skipping the CPU-only pass entirely. The
+  # cache filename encodes version/split/camera/num_frames/action_video_freq_ratio/
+  # global_sample_stride so changes to those keys invalidate it automatically. Delete
+  # the cache manually if you change processor transforms (delta_action_dim_mask etc.).
+  stats_cache_dir: ./data/dataset_stats_cache/nuscenes
 
 val:
   _target_: fastwam.datasets.nuscenes.nuscenes_video_dataset.NuScenesVideoDataset
@@ -89,3 +95,4 @@ mini:
   processor: ${data.train.processor}
   text_embedding_cache_dir: ${data.train.text_embedding_cache_dir}
   context_len: ${data.train.context_len}
+  stats_cache_dir: ${data.train.stats_cache_dir}

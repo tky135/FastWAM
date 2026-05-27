@@ -60,6 +60,7 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
         text_embedding_cache_dir: Optional[str] = None,
         context_len: int = 128,
         pretrained_norm_stats: Optional[str] = None,
+        stats_cache_dir: Optional[str] = None,
         is_training_set: bool = False,
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
@@ -90,6 +91,7 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
         self.skip_padding_as_possible = skip_padding_as_possible
         self.max_padding_retry = max_padding_retry
         self.override_instruction = override_instruction
+        self.stats_cache_dir = stats_cache_dir
         self.is_training_set = is_training_set
 
         if isinstance(shape_meta, DictConfig):
@@ -131,9 +133,40 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
                     raise ValueError(
                         "pretrained_norm_stats must be provided for validation/test sets."
                     )
+                # Cache flow: rank 0 looks for a deterministic stats file keyed by the
+                # dataset config (version/split/window/etc.); loads it if present, else
+                # recomputes and writes the cache. Other ranks wait at the broadcast
+                # below — they never touch the cache file directly, which avoids any
+                # read-during-write race.
+                cache_path = self._stats_cache_path()
                 if PartialState().is_main_process:
-                    logger.info("Computing nuScenes dataset stats for normalization...")
-                    dataset_stats = self._compute_dataset_stats(processor)
+                    dataset_stats = None
+                    if cache_path and os.path.exists(cache_path):
+                        logger.info(
+                            f"Loading cached nuScenes dataset stats: {cache_path}"
+                        )
+                        try:
+                            dataset_stats = load_dataset_stats_from_json(cache_path)
+                        except Exception as exc:
+                            logger.warning(
+                                f"Failed to load stats cache {cache_path}: {exc!r}. "
+                                "Recomputing from scratch."
+                            )
+                            dataset_stats = None
+                    if dataset_stats is None:
+                        logger.info(
+                            "Computing nuScenes dataset stats for normalization..."
+                        )
+                        dataset_stats = self._compute_dataset_stats(processor)
+                        if cache_path:
+                            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                            save_dataset_stats_to_json(dataset_stats, cache_path)
+                            logger.info(
+                                f"Saved nuScenes dataset stats cache: {cache_path}"
+                            )
+                    # Always mirror into work_dir so the val dataset (which receives
+                    # pretrained_norm_stats={work_dir}/dataset_stats.json from runtime)
+                    # finds the file regardless of whether train hit the cache or not.
                     work_dir = misc.get_work_dir() or "."
                     os.makedirs(work_dir, exist_ok=True)
                     save_dataset_stats_to_json(
@@ -332,7 +365,17 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
         proprio = np.stack([v_x, v_y, yaw_rate, speed], axis=-1).astype(np.float32)
         return torch.from_numpy(proprio)
 
-    def _build_raw_sample(self, idx: int) -> dict:
+    def _compute_actions_and_state(
+        self, idx: int
+    ) -> tuple[list[dict], torch.Tensor, torch.Tensor]:
+        """Build the (samples, actions, proprio) triple for one anchor — no image IO,
+        only ego-pose lookups.
+
+        Used by ``_build_raw_sample`` (which then loads images on top) and by the stats
+        pass (which doesn't need images at all — see _compute_dataset_stats). Pulling
+        this out matters because JPEG decode of the 9 front-camera frames dwarfs the
+        pose math, and the stats pass discards those frames immediately.
+        """
         anchor_token = self.sample_tokens[idx]
         samples = self._walk_forward_keyframes(anchor_token, self.num_frames)
         # Backward-diff proprio needs one keyframe before the anchor. The index builder
@@ -347,9 +390,6 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
         prev_translation, prev_rotation = self._get_ego_pose(prev_sample)
         prev_timestamp_us = float(prev_sample["timestamp"])
 
-        imgs = torch.stack(
-            [self._load_front_image(s) for s in samples], dim=0
-        )  # [T, 3, H, W] uint8
         translations = np.stack([self._get_ego_pose(s)[0] for s in samples], axis=0)
         rotations = np.stack([self._get_ego_pose(s)[1] for s in samples], axis=0)
         actions = self._compute_waypoints(translations, rotations)  # [T-1, 3]
@@ -361,6 +401,13 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
             prev_rotation=prev_rotation,
             prev_timestamp_us=prev_timestamp_us,
         )  # [T, 4]
+        return samples, actions, proprio
+
+    def _build_raw_sample(self, idx: int) -> dict:
+        samples, actions, proprio = self._compute_actions_and_state(idx)
+        imgs = torch.stack(
+            [self._load_front_image(s) for s in samples], dim=0
+        )  # [T, 3, H, W] uint8
 
         T = self.num_frames
         return {
@@ -375,6 +422,31 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
         }
 
     # ---- stats ----
+
+    def _stats_cache_path(self) -> Optional[str]:
+        """Deterministic, run-independent path for the cached normalization stats.
+
+        Returns ``None`` when ``stats_cache_dir`` is not configured (falls back to the
+        original "compute every run" behavior).
+
+        The cache key includes every parameter that affects which samples are scanned
+        or how their per-sample action/state values are computed: version, split,
+        camera_key (which selects the per-frame ego_pose), num_frames,
+        action_video_freq_ratio, and global_sample_stride. Changes to processor-side
+        action/state transforms (delta_action_dim_mask, action_state_transforms, …)
+        are NOT in the key — if you change those, delete the cache file manually.
+        """
+        if not self.stats_cache_dir:
+            return None
+        key = (
+            f"{self.version}"
+            f"__split-{self.split}"
+            f"__cam-{self.camera_key}"
+            f"__nf{self.num_frames}"
+            f"__avr{self.action_video_freq_ratio}"
+            f"__st{self.global_sample_stride}"
+        )
+        return os.path.join(self.stats_cache_dir, f"{key}.json")
 
     def _compute_dataset_stats(self, processor) -> dict:
         """One-pass scan over every anchor sample, producing the normalization stats dict
@@ -394,7 +466,11 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
         action_list: list[torch.Tensor] = []
         state_list: list[torch.Tensor] = []
         for i in tqdm(range(len(self)), desc="nuScenes stats pass"):
-            raw = self._build_raw_sample(i)
+            # Image-free fast path: stats only need action+state, so we skip the 9×PIL
+            # JPEG decode per anchor that `_build_raw_sample` would otherwise do. Without
+            # this skip, the stats pass is dominated by JPEG decode even though the
+            # decoded pixels are immediately thrown away.
+            _, actions, proprio = self._compute_actions_and_state(i)
             # Apply only the processor's `action_state_transform` step. This validates
             # shape_meta and runs any configured action/state transforms — but does NOT
             # normalize or merge keys. We want stats over the same values the runtime
@@ -402,8 +478,8 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
             # if you ever add e.g. a delta-action transform.
             transformed = processor.action_state_transform(
                 {
-                    "action": {k: v.clone() for k, v in raw["action"].items()},
-                    "state": {k: v.clone() for k, v in raw["state"].items()},
+                    "action": {self._action_key: actions.clone()},
+                    "state": {self._state_key: proprio.clone()},
                 }
             )
             action_list.append(transformed["action"][self._action_key])
