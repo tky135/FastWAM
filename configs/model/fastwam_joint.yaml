@@ -5,6 +5,10 @@ tokenizer_max_len: 128
 load_text_encoder: false
 proprio_dim: ${data.train.processor.proprio_output_dim}
 redirect_common_files: true
+# Set to a local path to load DiT + VAE + T5 + tokenizer directly from one official
+# Wan2.2-TI2V-5B checkpoint dir (bypasses DiffSynth-Studio; VAE loads at fp32, matching
+# the official pipeline). null = use model_id + the DiffSynth redirect (legacy default).
+local_dir: null
 mot_checkpoint_mixed_attn: true
 action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
 skip_dit_load_from_pretrain: false

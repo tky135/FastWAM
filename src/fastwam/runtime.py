@@ -53,6 +53,7 @@ def create_wan22_model(
     device: str = "cuda",
     vae_path: str | None = None,
     vae_dtype: torch.dtype | None = None,
+    local_dir: str | None = None,
 ):
     from .models.wan22.wan22 import Wan22Core
 
@@ -74,6 +75,7 @@ def create_wan22_model(
         num_train_timesteps=int(num_train_timesteps),
         vae_path=vae_path,
         vae_dtype=vae_dtype,
+        local_dir=local_dir,
     )
 
 
@@ -94,6 +96,8 @@ def create_fastwam(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    vae_dtype: torch.dtype | None = None,
+    local_dir: str | None = None,
 ):
     from .models.wan22.fastwam import FastWAM
 
@@ -159,6 +163,8 @@ def create_fastwam(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        vae_dtype=vae_dtype,
+        local_dir=local_dir,
     )
 
 
@@ -179,6 +185,8 @@ def create_fastwam_joint(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    vae_dtype: torch.dtype | None = None,
+    local_dir: str | None = None,
 ):
     from .models.wan22.fastwam_joint import FastWAMJoint
 
@@ -244,6 +252,8 @@ def create_fastwam_joint(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        vae_dtype=vae_dtype,
+        local_dir=local_dir,
     )
 
 
@@ -264,6 +274,8 @@ def create_fastwam_idm(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    vae_dtype: torch.dtype | None = None,
+    local_dir: str | None = None,
 ):
     from .models.wan22.fastwam_idm import (
         FastWAMIDM,
@@ -331,6 +343,8 @@ def create_fastwam_idm(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        vae_dtype=vae_dtype,
+        local_dir=local_dir,
     )
 
 

@@ -111,6 +111,8 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        vae_dtype: torch.dtype | None = None,
+        local_dir: str | None = None,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -127,6 +129,8 @@ class FastWAM(torch.nn.Module):
             dit_config=video_dit_config,
             skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
             load_text_encoder=load_text_encoder,
+            vae_dtype=vae_dtype,
+            local_dir=local_dir,
         )
 
         video_expert = components.dit

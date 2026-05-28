@@ -119,6 +119,7 @@ class Wan22Core(torch.nn.Module):
         num_train_timesteps: int = 1000,
         vae_path: str | None = None,
         vae_dtype: torch.dtype | None = None,
+        local_dir: str | None = None,
     ):
         if dit_config is None:
             raise ValueError("`dit_config` is required for Wan22Core.from_wan22_pretrained().")
@@ -132,6 +133,7 @@ class Wan22Core(torch.nn.Module):
             dit_config=dit_config,
             vae_path=vae_path,
             vae_dtype=vae_dtype,
+            local_dir=local_dir,
         )
         model = cls(
             dit=components.dit,
@@ -173,8 +175,20 @@ class Wan22Core(torch.nn.Module):
         ids, mask = self.tokenizer(prompt, return_mask=True, add_special_tokens=True)
         ids = ids.to(self.device)
         mask = mask.to(self.device, dtype=torch.bool)
-        prompt_emb = self.text_encoder(ids, mask)
-        return prompt_emb.to(device=self.device), mask
+        prompt_emb = self.text_encoder(ids, mask).to(device=self.device)
+        # Zero out padding positions in the T5 context. The trained Wan2.2 model was
+        # calibrated against zero-padded context (the official `WanModel.forward` at
+        # model.py:472-478 takes a *truncated* T5 output from the encoder and pads it
+        # with zeros internally before running text_embedding). Training code also
+        # applies this zero-out (see RobotVideoDataset._get_cached_text_context).
+        #
+        # Without this, the FastWAM inference path passes the *full* T5 output for all
+        # text_len=512 positions — including non-zero values at padding positions due to
+        # bias terms in T5. Cross-attention then attends to padding positions with
+        # different K/V values than training/official, producing visibly different output
+        # despite the rest of the DiT being numerically equivalent.
+        prompt_emb = prompt_emb.masked_fill(~mask.unsqueeze(-1), 0.0)
+        return prompt_emb, mask
 
     def _encode_video_latents(self, video_tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
         # Cast input to VAE dtype (may differ from DiT dtype, e.g. fp32 VAE + bf16 DiT).
@@ -484,10 +498,27 @@ class Wan22Core(torch.nn.Module):
             sample_scheduler.set_timesteps(
                 num_inference_steps, device=self.device, shift=effective_shift,
             )
-            # Match the official precision policy for the inference state: fp32 latents,
-            # bf16 (or whatever torch_dtype is) used only inside the DiT call via autocast.
-            # The Euler path above runs everything in torch_dtype for backwards compat.
-            latents = latents.to(dtype=torch.float32)
+            # Re-sample noise to match official `WanTI2V.generate` (textimage2video.py:486-494):
+            # GPU generator + fp32 noise sampled directly on GPU. The default initialization
+            # above samples on `rand_device` (typically CPU) and casts through bf16, which:
+            #   (1) Produces a different noise pattern (CPU MT vs CUDA Philox RNG with same seed).
+            #   (2) Round-trips fp32 → bf16 → fp32, losing the trailing mantissa bits.
+            # Re-sampling here on GPU at fp32 makes the initial latents bit-exact (modulo
+            # RNG algorithm choice) to what the official pipeline produces.
+            if seed is not None and self.device.type == "cuda":
+                gpu_generator = torch.Generator(device=self.device).manual_seed(seed)
+                latents = torch.randn(
+                    (1, self.vae.model.z_dim, latent_t, latent_h, latent_w),
+                    generator=gpu_generator,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                # Re-pin the conditioning image latent at the first temporal index
+                # (the previous pinning at line 334 used the bf16 latents we just discarded).
+                latents[:, :, 0:1] = z
+            else:
+                # Fall back to the CPU-sampled latents (no seed, or non-CUDA device).
+                latents = latents.to(dtype=torch.float32)
             unipc_first_frame = first_frame_latents.to(dtype=torch.float32)
             for t in sample_scheduler.timesteps:
                 timestep = t.unsqueeze(0).to(dtype=torch.float32, device=self.device)

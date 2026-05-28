@@ -517,11 +517,26 @@ class WanVideoDiT(torch.nn.Module):
         return x
 
     def unpatchify(self, x: torch.Tensor, grid_size: torch.Tensor):
-        return rearrange(
-            x, 'b (f h w) (x y z c) -> b c (f x) (h y) (w z)',
-            f=grid_size[0], h=grid_size[1], w=grid_size[2], 
-            x=self.patch_size[0], y=self.patch_size[1], z=self.patch_size[2]
-        )
+        # Mirror official `WanModel.unpatchify` (Wan2.2/wan/modules/model.py:516-522)
+        # by using `torch.einsum` for the permutation step. `torch.einsum` is in PyTorch's
+        # autocast downcast list, so under `autocast(dtype=bf16)` (the production context),
+        # this op casts the fp32 input to bf16 and returns bf16. The model was trained
+        # under exactly this autocast pattern, so the trained head-Linear output's
+        # downstream values expect to be bf16-quantized here. Replacing this with
+        # `einops.rearrange` (which uses `view + permute + reshape` and is NOT in the
+        # autocast list) preserves fp32 precision — technically more accurate but
+        # *out of training distribution* by exactly bf16-ULP, producing a 7.7e-3 max
+        # diff at the model output that compounds catastrophically over 50 denoising
+        # steps × CFG=5 amplification.
+        f, h, w = int(grid_size[0]), int(grid_size[1]), int(grid_size[2])
+        p1, p2, p3 = self.patch_size
+        c = x.shape[-1] // (p1 * p2 * p3)
+        # x: [B, f*h*w, p1*p2*p3*c] -> [B, f, h, w, p1, p2, p3, c]
+        x = x.view(x.shape[0], f, h, w, p1, p2, p3, c)
+        # einsum permute: [B, f, h, w, p1, p2, p3, c] -> [B, c, f, p1, h, p2, w, p3]
+        x = torch.einsum('bfhwpqrc->bcfphqwr', x)
+        # Reshape combining (f, p1), (h, p2), (w, p3): [B, c, f*p1, h*p2, w*p3]
+        return x.reshape(x.shape[0], c, f * p1, h * p2, w * p3)
 
     def _validate_forward_inputs(
         self,
@@ -745,7 +760,13 @@ class WanVideoDiT(torch.nn.Module):
         f, h, w = pre_state["meta"]["grid_size"]
         x = self.head(x_tokens, pre_state["t"])
         x = self.unpatchify(x, (f, h, w))
-        return x
+        # Match official `WanModel.forward` (model.py:497): `return [u.float() for u in x]`.
+        # The explicit fp32 cast guards the returned tensor from being implicitly downcast
+        # to bf16 by the outer autocast bf16 context at the caller. Without it, the
+        # downstream noise prediction (and subsequent CFG combination + scheduler step)
+        # operates on bf16-truncated values rather than fp32, introducing per-step bf16
+        # quantization noise (~7.7e-3 max) that compounds catastrophically over 50 steps.
+        return x.float()
 
     def forward(
         self,

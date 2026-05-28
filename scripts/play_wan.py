@@ -259,6 +259,15 @@ def main():
     parser.add_argument("--tokenizer-model-id", default="Wan-AI/Wan2.1-T2V-1.3B")
     parser.add_argument("--tokenizer-max-len", type=int, default=512)
     parser.add_argument(
+        "--local-dir", default=None,
+        help=(
+            "Path to a single official Wan2.2-TI2V-5B checkpoint directory. When set, the "
+            "DiT, VAE (fp32), T5, and tokenizer are all loaded directly from this directory "
+            "— no DiffSynth-Studio redirect, no download. This is the recommended way to run "
+            "against the official weights; --vae-pth/--vae-fp32 become unnecessary."
+        ),
+    )
+    parser.add_argument(
         "--vae-pth", default=None,
         help=(
             "Override path to the official Wan2.2_VAE.pth (or any fp32 weight file). "
@@ -335,8 +344,12 @@ def main():
         f"Loading Wan2.2 components: model={args.model_id}, tokenizer={args.tokenizer_model_id}, "
         f"dtype={args.dtype}, device={args.device}."
     )
+    # In --local-dir mode the loader sources the VAE from the dir's fp32 Wan2.2_VAE.pth and
+    # defaults it to fp32 automatically, so no separate vae override is needed.
     vae_dtype_override = torch.float32 if (args.vae_fp32 or args.vae_pth) else None
-    if vae_dtype_override is not None:
+    if args.local_dir is not None:
+        logger.info("Loading all components directly from --local-dir=%s (no DiffSynth redirect).", args.local_dir)
+    elif vae_dtype_override is not None:
         logger.info(
             "Loading VAE at fp32 (override). %s",
             f"Source: {args.vae_pth}" if args.vae_pth else "Source: default mirror (will be cast bf16→fp32 on load).",
@@ -354,6 +367,7 @@ def main():
         device=args.device,
         vae_path=args.vae_pth,
         vae_dtype=vae_dtype_override,
+        local_dir=args.local_dir,
     )
     logger.info("Loaded. Local checkpoint paths:")
     for name, path in getattr(model, "model_paths", {}).items():
