@@ -138,6 +138,20 @@ def _resolve_configs(model_id: str, tokenizer_model_id: str, redirect_common_fil
     return dit_config, text_config, vae_config, tokenizer_config
 
 
+def _load_vae_from_path(path: str, torch_dtype: torch.dtype, device: str):
+    """Load the VAE from an arbitrary file path, bypassing the hash registry.
+
+    Used when the caller wants to override the default DiffSynth-Studio bf16 mirror
+    with the official fp32 `Wan2.2_VAE.pth`. Same converter as the registry path
+    (prefixes every key with `model.`), no hash validation.
+    """
+    state_dict = load_state_dict(path, torch_dtype=torch_dtype, device="cpu")
+    state_dict = wan_video_vae_state_dict_converter(state_dict)
+    model = WanVideoVAE38()
+    model.load_state_dict(state_dict, strict=False)
+    return model.to(device=device, dtype=torch_dtype)
+
+
 def load_wan22_ti2v_5b_components(
     device: str = "cuda",
     torch_dtype: torch.dtype = torch.bfloat16,
@@ -148,6 +162,8 @@ def load_wan22_ti2v_5b_components(
     dit_config: dict[str, Any] | None = None,
     skip_dit_load_from_pretrain: bool = False,
     load_text_encoder: bool = True,
+    vae_path: str | None = None,
+    vae_dtype: torch.dtype | None = None,
 ):
     logger.info("Loading Wan2.2-TI2V-5B components...")
     start = time.time()
@@ -207,7 +223,19 @@ def load_wan22_ti2v_5b_components(
             "Skipping pretrained text encoder/tokenizer load (`load_text_encoder=False`); "
             "training must provide cached `context/context_mask`."
         )
-    vae: WanVideoVAE38 = _load_registered_model(vae_config.path, "wan_video_vae", torch_dtype=torch_dtype, device=device)
+    effective_vae_dtype = vae_dtype if vae_dtype is not None else torch_dtype
+    if vae_path is not None:
+        logger.info(
+            "Loading VAE from override path (%s) at dtype=%s, bypassing the DiffSynth redirect + hash check.",
+            vae_path, effective_vae_dtype,
+        )
+        vae = _load_vae_from_path(vae_path, torch_dtype=effective_vae_dtype, device=device)
+        resolved_vae_path = vae_path
+    else:
+        vae: WanVideoVAE38 = _load_registered_model(
+            vae_config.path, "wan_video_vae", torch_dtype=effective_vae_dtype, device=device
+        )
+        resolved_vae_path = str(vae_config.path)
     logger.info("Finished loading Wan2.2-TI2V-5B components in %.2f seconds.", time.time() - start)
     return Wan22LoadedComponents(
         dit=dit,
@@ -215,7 +243,7 @@ def load_wan22_ti2v_5b_components(
         text_encoder=text_encoder,
         tokenizer=tokenizer,
         dit_path=dit_path,
-        vae_path=str(vae_config.path),
+        vae_path=resolved_vae_path,
         text_encoder_path=text_encoder_path,
         tokenizer_path=tokenizer_path,
     )

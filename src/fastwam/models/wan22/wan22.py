@@ -1,13 +1,67 @@
 import numpy as np
 import os
+import sys
 import torch
 import torch.nn.functional as F
+from pathlib import Path
 from PIL import Image
 from typing import Any, Optional, Sequence, Union
 
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 from .wan_video_dit import WanVideoDiT
+
+
+def _import_flow_unipc_scheduler():
+    """Locate `FlowUniPCMultistepScheduler` from a Wan2.2 source tree.
+
+    It's a custom class shipped at `Wan2.2/wan/utils/fm_solvers_unipc.py` (the Alibaba
+    team's port of diffusers' UniPC to flow matching), not part of diffusers proper.
+    Search order:
+      1. `wan.utils.fm_solvers_unipc` already importable on sys.path.
+      2. $WAN22_PATH if set.
+      3. Common neighboring layouts (third_party/Wan2.2, ../Wan2.2, etc.).
+    """
+    try:
+        from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler  # type: ignore[import-not-found]
+        return FlowUniPCMultistepScheduler
+    except ImportError:
+        pass
+
+    candidates: list[Path] = []
+    env_path = os.environ.get("WAN22_PATH")
+    if env_path:
+        candidates.append(Path(env_path))
+
+    here = Path(__file__).resolve()
+    # wan22.py: .../FastWAM/src/fastwam/models/wan22/wan22.py
+    # parents[5] = .../<third_party-or-equivalent>/; sibling layout: third_party/Wan2.2/.
+    for offset in (5, 4, 3, 2):
+        try:
+            candidates.append(here.parents[offset] / "Wan2.2")
+        except IndexError:
+            pass
+    candidates.extend([
+        Path.cwd() / "Wan2.2",
+        Path.cwd().parent / "Wan2.2",
+        Path.cwd().parent.parent / "Wan2.2",
+    ])
+
+    for candidate in candidates:
+        if (candidate / "wan" / "utils" / "fm_solvers_unipc.py").is_file():
+            sys.path.insert(0, str(candidate))
+            from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler  # type: ignore[import-not-found]
+            return FlowUniPCMultistepScheduler
+
+    raise ImportError(
+        "Cannot find `FlowUniPCMultistepScheduler`. It's a custom scheduler shipped with "
+        "the Wan2.2 source tree at `wan/utils/fm_solvers_unipc.py`, not from diffusers. "
+        "Fix one of:\n"
+        "  (a) Set the env var WAN22_PATH=/path/to/Wan2.2\n"
+        "  (b) `pip install -e /path/to/Wan2.2` so `wan.utils` is importable\n"
+        "  (c) Put the Wan2.2 clone next to FastWAM (e.g. third_party/Wan2.2)\n"
+        f"Searched: {[str(c) for c in candidates]}"
+    )
 
 
 class Wan22Core(torch.nn.Module):
@@ -40,6 +94,14 @@ class Wan22Core(torch.nn.Module):
         )
         self.device = torch.device(device)
         self.torch_dtype = torch_dtype
+        # VAE may run at a different precision than the DiT (e.g. fp32 VAE + bf16 DiT
+        # to match the official Wan2.2 inference, which autocasts the VAE to fp32 while
+        # running the DiT at param_dtype). We detect this from the loaded weights so the
+        # encode/decode call sites can cast in/out tensors as needed.
+        try:
+            self.vae_dtype = next(vae.parameters()).dtype
+        except StopIteration:
+            self.vae_dtype = torch_dtype
         self.to(self.device)
 
     @classmethod
@@ -55,6 +117,8 @@ class Wan22Core(torch.nn.Module):
         train_shift: float = 5.0,
         infer_shift: float = 5.0,
         num_train_timesteps: int = 1000,
+        vae_path: str | None = None,
+        vae_dtype: torch.dtype | None = None,
     ):
         if dit_config is None:
             raise ValueError("`dit_config` is required for Wan22Core.from_wan22_pretrained().")
@@ -66,6 +130,8 @@ class Wan22Core(torch.nn.Module):
             tokenizer_max_len=tokenizer_max_len,
             redirect_common_files=redirect_common_files,
             dit_config=dit_config,
+            vae_path=vae_path,
+            vae_dtype=vae_dtype,
         )
         model = cls(
             dit=components.dit,
@@ -111,8 +177,9 @@ class Wan22Core(torch.nn.Module):
         return prompt_emb.to(device=self.device), mask
 
     def _encode_video_latents(self, video_tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
+        # Cast input to VAE dtype (may differ from DiT dtype, e.g. fp32 VAE + bf16 DiT).
         z = self.vae.encode(
-            video_tensor,
+            video_tensor.to(dtype=self.vae_dtype) if isinstance(video_tensor, torch.Tensor) else video_tensor,
             device=self.device,
             tiled=tiled,
             tile_size=tile_size,
@@ -127,14 +194,17 @@ class Wan22Core(torch.nn.Module):
             raise ValueError(
                 f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
             )
-        image = input_image.to(device=self.device)[0].unsqueeze(1)
+        # Cast input to VAE dtype so the conv weights and image tensor match.
+        image = input_image.to(device=self.device, dtype=self.vae_dtype)[0].unsqueeze(1)
         z = self.vae.encode([image], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         if isinstance(z, list):
             z = z[0].unsqueeze(0)
         return z
 
     def _decode_latents(self, latents, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
-        video_tensor = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        # Cast latents to VAE dtype before decoding; the post-decode `.float().clamp(...)` below
+        # handles the conversion back to a common dtype.
+        video_tensor = self.vae.decode(latents.to(dtype=self.vae_dtype), device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         video_tensor = video_tensor.squeeze(0).detach().float().clamp(-1, 1)
         video_tensor = ((video_tensor + 1.0) * 127.5).to(torch.uint8).cpu()
         frames = []
@@ -285,8 +355,19 @@ class Wan22Core(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        solver: str = "euler",
         **kwargs
     ):
+        """Run I2V denoising.
+
+        `solver` selects the integration method for the flow-matching ODE:
+          - "euler"  : FastWAM's built-in flat Euler step (single-step). Default.
+          - "unipc"  : the official Wan2.2 inference solver — diffusers'
+                       `FlowUniPCMultistepScheduler`, the multistep predictor-corrector
+                       method used by `wan/textimage2video.py:527-534, 591-597`.
+                       At <50 steps UniPC is noticeably sharper than Euler; at 50+ the
+                       gap narrows. Requires `diffusers` installed.
+        """
         self.eval()
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
@@ -342,45 +423,87 @@ class Wan22Core(torch.nn.Module):
             context_nega, context_nega_mask = self.encode_prompt("" if negative_prompt is None else negative_prompt)
         action_nega = torch.zeros_like(action) if (action is not None and action_cfg_scale != 1.0) else None
 
-        infer_timesteps, infer_deltas = self.infer_scheduler.build_inference_schedule(
-            num_inference_steps=num_inference_steps,
-            device=self.device,
-            dtype=latents.dtype,
-            shift_override=sigma_shift,
-        )
-        for step_t, step_delta in zip(infer_timesteps, infer_deltas):
-            timestep = step_t.unsqueeze(0).to(dtype=latents.dtype, device=self.device)
-            noise_pred_posi = self._model_fn(
-                latents=latents,
-                timestep=timestep,
+        # Inline closure for the per-step CFG-combined noise prediction. Shared between
+        # the Euler and UniPC solvers — only the integration step itself differs.
+        def _compute_noise_pred(latents_in: torch.Tensor, timestep_in: torch.Tensor) -> torch.Tensor:
+            noise_pred_posi_local = self._model_fn(
+                latents=latents_in,
+                timestep=timestep_in,
                 context=context_posi,
                 context_mask=context_posi_mask,
                 action=action,
                 fuse_vae_embedding_in_latents=fuse_flag,
             )
-            noise_pred = noise_pred_posi
+            np_out = noise_pred_posi_local
             if context_nega is not None:
-                noise_pred_text_nega = self._model_fn(
-                    latents=latents,
-                    timestep=timestep,
+                noise_pred_text_nega_local = self._model_fn(
+                    latents=latents_in,
+                    timestep=timestep_in,
                     context=context_nega,
                     context_mask=context_nega_mask,
                     action=action,
                     fuse_vae_embedding_in_latents=fuse_flag,
                 )
-                noise_pred = noise_pred + (text_cfg_scale - 1.0) * (noise_pred_posi - noise_pred_text_nega)
+                np_out = np_out + (text_cfg_scale - 1.0) * (noise_pred_posi_local - noise_pred_text_nega_local)
             if action_nega is not None:
-                noise_pred_action_nega = self._model_fn(
-                    latents=latents,
-                    timestep=timestep,
+                noise_pred_action_nega_local = self._model_fn(
+                    latents=latents_in,
+                    timestep=timestep_in,
                     context=context_posi,
                     context_mask=context_posi_mask,
                     action=action_nega,
                     fuse_vae_embedding_in_latents=fuse_flag,
                 )
-                noise_pred = noise_pred + (action_cfg_scale - 1.0) * (noise_pred_posi - noise_pred_action_nega)
-            latents = self.infer_scheduler.step(noise_pred, step_delta, latents)
-            latents[:, :, 0:1] = first_frame_latents
+                np_out = np_out + (action_cfg_scale - 1.0) * (noise_pred_posi_local - noise_pred_action_nega_local)
+            return np_out
+
+        if solver == "euler":
+            infer_timesteps, infer_deltas = self.infer_scheduler.build_inference_schedule(
+                num_inference_steps=num_inference_steps,
+                device=self.device,
+                dtype=latents.dtype,
+                shift_override=sigma_shift,
+            )
+            for step_t, step_delta in zip(infer_timesteps, infer_deltas):
+                timestep = step_t.unsqueeze(0).to(dtype=latents.dtype, device=self.device)
+                noise_pred = _compute_noise_pred(latents, timestep)
+                latents = self.infer_scheduler.step(noise_pred, step_delta, latents)
+                latents[:, :, 0:1] = first_frame_latents
+        elif solver == "unipc":
+            FlowUniPCMultistepScheduler = _import_flow_unipc_scheduler()
+            # Mirror the official Wan2.2 setup at wan/textimage2video.py:527-534: build the
+            # scheduler with shift=1 + use_dynamic_shifting=False, then bake in the actual
+            # shift via set_timesteps. The set_timesteps' `shift` argument is what becomes
+            # the flow-matching shift parameter we usually call `sigma_shift`.
+            sample_scheduler = FlowUniPCMultistepScheduler(
+                num_train_timesteps=self.infer_scheduler.num_train_timesteps,
+                shift=1,
+                use_dynamic_shifting=False,
+            )
+            effective_shift = sigma_shift if sigma_shift is not None else self.infer_scheduler.shift
+            sample_scheduler.set_timesteps(
+                num_inference_steps, device=self.device, shift=effective_shift,
+            )
+            # Match the official precision policy for the inference state: fp32 latents,
+            # bf16 (or whatever torch_dtype is) used only inside the DiT call via autocast.
+            # The Euler path above runs everything in torch_dtype for backwards compat.
+            latents = latents.to(dtype=torch.float32)
+            unipc_first_frame = first_frame_latents.to(dtype=torch.float32)
+            for t in sample_scheduler.timesteps:
+                timestep = t.unsqueeze(0).to(dtype=torch.float32, device=self.device)
+                with torch.amp.autocast(
+                    device_type=self.device.type, dtype=self.torch_dtype,
+                    enabled=(self.device.type == "cuda" and self.torch_dtype != torch.float32),
+                ):
+                    noise_pred = _compute_noise_pred(latents, timestep)
+                noise_pred = noise_pred.to(dtype=torch.float32)
+                step_out = sample_scheduler.step(
+                    noise_pred, t, latents, return_dict=False, generator=generator,
+                )[0]
+                latents = step_out
+                latents[:, :, 0:1] = unipc_first_frame
+        else:
+            raise ValueError(f"Unsupported `solver`: {solver!r}. Expected 'euler' or 'unipc'.")
 
         return {"video": self._decode_latents(latents, tiled=tiled)}
 

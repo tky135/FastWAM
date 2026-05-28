@@ -12,6 +12,62 @@ logger = get_logger(__name__)
 
     
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, ctx_mask: Optional[torch.Tensor] = None, compatibility_mode=True):
+    """Attention wrapper that matches the official Wan2.2 backend (flash_attn) when no
+    mask is provided; falls back to SDPA only when a mask is required.
+
+    The official kernel (`flash_attn.flash_attn_varlen_func`) and PyTorch's SDPA can
+    produce slightly different bf16 outputs for identical Q/K/V due to different
+    block-wise softmax / accumulation orders. The trained Wan2.2 weights were calibrated
+    to flash_attn's numerics, so using SDPA introduces ~1e-2 per-block drift that
+    compounds catastrophically over 30 blocks × 50 denoising steps × CFG=5 amplification.
+    See Wan2.2/wan/modules/attention.py:24-130 for the official implementation.
+
+    Input shape:  [B, S, n*d]  (n=num_heads, d=head_dim)
+    Output shape: [B, S, n*d]
+    """
+    out_dtype = q.dtype
+
+    # Fast path: use flash_attn's varlen API for exact bit-equivalence with the official
+    # Wan2.2 forward. Only available when (a) flash_attn is installed and (b) no mask is
+    # provided (varlen handles per-batch lengths, not per-position masks).
+    if ctx_mask is None:
+        try:
+            from flash_attn import flash_attn_varlen_func
+        except ImportError:
+            flash_attn_varlen_func = None
+
+        if flash_attn_varlen_func is not None:
+            # Reshape to [B, S, n, d] (the official's expected input shape).
+            qh = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
+            kh = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
+            vh = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
+            b, lq = qh.shape[0], qh.shape[1]
+            lk = kh.shape[1]
+
+            # Cast to bf16 to match the official `half(...)` step. Flash attention's CUDA
+            # kernels require half precision (fp16 or bf16).
+            half_dtype = torch.bfloat16 if qh.dtype not in (torch.float16, torch.bfloat16) else qh.dtype
+            qf = qh.flatten(0, 1).to(half_dtype)
+            kf = kh.flatten(0, 1).to(half_dtype)
+            vf = vh.flatten(0, 1).to(half_dtype)
+
+            q_lens = torch.tensor([lq] * b, dtype=torch.int32, device=q.device)
+            k_lens = torch.tensor([lk] * b, dtype=torch.int32, device=q.device)
+            cu_seqlens_q = torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(0, dtype=torch.int32)
+            cu_seqlens_k = torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(0, dtype=torch.int32)
+
+            x = flash_attn_varlen_func(
+                q=qf, k=kf, v=vf,
+                cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=lq, max_seqlen_k=lk,
+                dropout_p=0.0, softmax_scale=None, causal=False,
+                window_size=(-1, -1), deterministic=False,
+            ).unflatten(0, (b, lq))
+            x = x.to(out_dtype)
+            return rearrange(x, "b s n d -> b s (n d)")
+
+    # Fallback: SDPA. Used when a mask is provided (cross-attention with context_mask)
+    # or when flash_attn is unavailable. Numerically diverges slightly from official.
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
@@ -29,10 +85,18 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
 
 
 def sinusoidal_embedding_1d(dim, position):
+    # Mirrors the official Wan2.2 implementation (Wan2.2/wan/modules/model.py:14-24):
+    # math in fp64, returns fp64 — caller is responsible for any cast. The previous
+    # `.to(position.dtype)` here truncated to bf16 when callers passed bf16 positions,
+    # destroying ~7 mantissa bits of the timestep embedding even before the caller's
+    # `.float()` could extend it back to fp32. That propagated into `time_embedding` →
+    # `time_projection` → modulation → `(1 + scale_msa) * norm1(x) + shift_msa`, producing
+    # spurious divergence at the first DiT block when running side-by-side with the
+    # official WanModel under matched inputs.
     sinusoid = torch.outer(position.type(torch.float64), torch.pow(
         10000, -torch.arange(dim//2, dtype=torch.float64, device=position.device).div(dim//2)))
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
-    return x.to(position.dtype)
+    return x
 
 
 def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):
@@ -158,6 +222,25 @@ class RMSNorm(nn.Module):
         return self.norm(x.float()).to(dtype) * self.weight
 
 
+class Wan22LayerNorm(nn.LayerNorm):
+    """Mirror of official `WanLayerNorm` (Wan2.2/wan/modules/model.py:88-98).
+
+    Computes LayerNorm in fp32 for numerical stability, then casts the result back to
+    the input dtype. This matters because the model was trained with this *exact*
+    precision policy — under PyTorch autocast bf16, plain `nn.LayerNorm` would return
+    fp32 (no cast-back), and the resulting full-precision activations are
+    out-of-distribution for the bf16-trained downstream linear layers. The mismatch
+    compounds over 30 blocks × 50 denoising steps × CFG=5 amplification into visibly
+    wrong output even though the math is identical.
+    """
+
+    def __init__(self, dim, eps=1e-6, elementwise_affine=False):
+        super().__init__(dim, elementwise_affine=elementwise_affine, eps=eps)
+
+    def forward(self, x):
+        return super().forward(x.float()).type_as(x)
+
+
 class AttentionModule(nn.Module):
     def __init__(self, num_heads):
         super().__init__()
@@ -238,9 +321,11 @@ class DiTBlock(nn.Module):
         self.self_attn = SelfAttention(hidden_dim, attn_head_dim, num_heads, eps)
         self.cross_attn = CrossAttention(
             hidden_dim, attn_head_dim, num_heads, eps)
-        self.norm1 = nn.LayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
-        self.norm3 = nn.LayerNorm(hidden_dim, eps=eps)
+        # Wan22LayerNorm (not plain nn.LayerNorm) is required so the output is cast back
+        # to the input dtype after the fp32 LN computation. See class docstring.
+        self.norm1 = Wan22LayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
+        self.norm2 = Wan22LayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
+        self.norm3 = Wan22LayerNorm(hidden_dim, eps=eps, elementwise_affine=True)
         self.ffn = nn.Sequential(nn.Linear(hidden_dim, ffn_dim), nn.GELU(
             approximate='tanh'), nn.Linear(ffn_dim, hidden_dim))
         self.modulation = nn.Parameter(torch.randn(1, 6, hidden_dim) / hidden_dim**0.5)
@@ -251,20 +336,35 @@ class DiTBlock(nn.Module):
             context_mask = context_mask.unsqueeze(1) # (B, 1, seq_len, context_len), 1 for heads
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
-        # msa: multi-head self-attention  mlp: multi-layer perceptron
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=chunk_dim)
+        # Precision policy mirrors official Wan2.2 `WanAttentionBlock.forward` (model.py:237-258):
+        # modulation arithmetic, norm-to-modulation, and gate additions all in fp32 so the
+        # residual stream stays fp32 across the 30 transformer blocks. Heavy matmuls (attn,
+        # ffn linears) still run in bf16 via the outer autocast.
+        with torch.amp.autocast("cuda", dtype=torch.float32):
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                self.modulation.float() + t_mod.float()
+            ).chunk(6, dim=chunk_dim)
         if has_seq:
-            # means t_mod has separate modulation for each token, otherwise same modulation for all tokens in the block
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
                 shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2),
                 shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
             )
-        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, self_attn_mask=self_attn_mask))
+
+        # Self-attn: norm in fp32, mod arithmetic fp32, attn body in autocast dtype, gate add in fp32.
+        input_x = self.norm1(x).float() * (1 + scale_msa) + shift_msa
+        y = self.self_attn(input_x, freqs, self_attn_mask=self_attn_mask)
+        with torch.amp.autocast("cuda", dtype=torch.float32):
+            x = x.float() + y.float() * gate_msa
+
+        # Cross-attn: official does not force fp32 on this add; dtype-promotion via the
+        # fp32 LHS keeps the residual fp32.
         x = x + self.cross_attn(self.norm3(x), context, ctx_mask=context_mask)
-        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = self.gate(x, gate_mlp, self.ffn(input_x))
+
+        # FFN: same precision pattern as self-attn.
+        input_x = self.norm2(x).float() * (1 + scale_mlp) + shift_mlp
+        y = self.ffn(input_x)
+        with torch.amp.autocast("cuda", dtype=torch.float32):
+            x = x.float() + y.float() * gate_mlp
         return x
 
 
@@ -293,18 +393,27 @@ class Head(nn.Module):
         super().__init__()
         self.dim = dim
         self.patch_size = patch_size
-        self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        # Wan22LayerNorm matches official `Head.norm = WanLayerNorm(dim, eps)` precision policy.
+        self.norm = Wan22LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.head = nn.Linear(dim, out_dim * math.prod(patch_size))
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
     def forward(self, x, t_mod):
-        if len(t_mod.shape) == 3:
-            shift, scale = (self.modulation.unsqueeze(0).to(dtype=t_mod.dtype, device=t_mod.device) + t_mod.unsqueeze(2)).chunk(2, dim=2)
-            x = (self.head(self.norm(x) * (1 + scale.squeeze(2)) + shift.squeeze(2)))
-        else:
-            shift, scale = (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(2, dim=1)
-            x = (self.head(self.norm(x) * (1 + scale) + shift))
-        return x
+        # Mirror official `Head.forward` (model.py:285-291): the ENTIRE body — mod arithmetic,
+        # norm-mod multiplication, AND the head Linear — runs inside an fp32 autocast block.
+        # The previous version closed the autocast before `self.head(...)`, so the final
+        # 3072 → out_dim*prod(patch_size) projection ran in bf16 (under outer autocast),
+        # producing ~1.5e-2 final output divergence vs the official.
+        with torch.amp.autocast("cuda", dtype=torch.float32):
+            if len(t_mod.shape) == 3:
+                shift, scale = (
+                    self.modulation.float().unsqueeze(0) + t_mod.float().unsqueeze(2)
+                ).chunk(2, dim=2)
+                modulated = self.norm(x).float() * (1 + scale.squeeze(2)) + shift.squeeze(2)
+            else:
+                shift, scale = (self.modulation.float() + t_mod.float()).chunk(2, dim=1)
+                modulated = self.norm(x).float() * (1 + scale) + shift
+            return self.head(modulated)
 
 
 class WanVideoDiT(torch.nn.Module):
@@ -545,9 +654,13 @@ class WanVideoDiT(torch.nn.Module):
             ) * timestep.view(batch_size, 1, 1)
             token_timesteps[:, 0, :] = 0
             token_timesteps = token_timesteps.reshape(batch_size, -1)
-            token_t_emb = sinusoidal_embedding_1d(self.freq_dim, token_timesteps.reshape(-1))
-            t = self.time_embedding(token_t_emb).reshape(batch_size, -1, self.hidden_dim)
-            t_mod = self.time_projection(t).unflatten(2, (6, self.hidden_dim))
+            # Time embedding in fp32 — mirrors official `WanModel.forward` (model.py:462-469).
+            # Each block downstream asserts `e.dtype == torch.float32`, so this is mandatory
+            # for matching the official precision policy.
+            with torch.amp.autocast("cuda", dtype=torch.float32):
+                token_t_emb = sinusoidal_embedding_1d(self.freq_dim, token_timesteps.reshape(-1)).float()
+                t = self.time_embedding(token_t_emb).reshape(batch_size, -1, self.hidden_dim)
+                t_mod = self.time_projection(t).unflatten(2, (6, self.hidden_dim))
         else:
             raise NotImplementedError("Only support seperated_timestep with fuse_vae_embedding_in_latents for now.")
             t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
@@ -560,9 +673,12 @@ class WanVideoDiT(torch.nn.Module):
         if self.action_conditioned and action is not None:
             action_len = action.shape[1]
             action_emb = self.action_embedding(action) # (B, action_len, dim)
-            action_pos_embed = sinusoidal_embedding_1d(self.hidden_dim, 
-                torch.arange(action_len, device=action_emb.device)) # (action_len, dim)
-            action_emb = action_emb + action_pos_embed.unsqueeze(0) # (B, action_len, dim)
+            action_pos_embed = sinusoidal_embedding_1d(self.hidden_dim,
+                torch.arange(action_len, device=action_emb.device)) # (action_len, dim) — fp64
+            # Cast back to action_emb's dtype: `sinusoidal_embedding_1d` now returns fp64
+            # (to match official precision policy at Wan2.2/wan/modules/model.py:14-24).
+            # Without this cast the fp64 result would promote action_emb to fp64.
+            action_emb = action_emb + action_pos_embed.unsqueeze(0).to(action_emb.dtype) # (B, action_len, dim)
             context = torch.cat([context, action_emb], dim=1) # (B, context_len + action_len, dim)
 
             # new mask
@@ -595,7 +711,13 @@ class WanVideoDiT(torch.nn.Module):
                 )
             context_mask = context_mask.unsqueeze(1).expand(-1, f * h * w, -1) # (B, seq_len, L)
         else:
-            context_mask = context_mask.unsqueeze(1).expand(-1, f * h * w, -1) # (B, seq_len, L)
+            # Match official Wan2.2: cross-attention runs with NO mask (context_lens=None
+            # at model.py:472). The text_embedding of padded positions contributes small
+            # but non-zero K/V values, and the trained model expects to attend to them.
+            # Applying a mask here forces FastWAM's flash_attention wrapper down the SDPA
+            # fallback path (which diverges from flash_attn's bf16 numerics by ~1e-2 per
+            # block, compounding catastrophically over 30 blocks × 50 steps × CFG=5).
+            context_mask = None
 
         x_tokens = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
 

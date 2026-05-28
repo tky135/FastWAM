@@ -51,6 +51,8 @@ def create_wan22_model(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    vae_path: str | None = None,
+    vae_dtype: torch.dtype | None = None,
 ):
     from .models.wan22.wan22 import Wan22Core
 
@@ -70,6 +72,8 @@ def create_wan22_model(
         train_shift=float(train_shift),
         infer_shift=float(infer_shift),
         num_train_timesteps=int(num_train_timesteps),
+        vae_path=vae_path,
+        vae_dtype=vae_dtype,
     )
 
 
