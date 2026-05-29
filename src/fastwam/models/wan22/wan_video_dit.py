@@ -12,6 +12,62 @@ logger = get_logger(__name__)
 
     
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, ctx_mask: Optional[torch.Tensor] = None, compatibility_mode=True):
+    """Attention wrapper that matches the official Wan2.2 backend (flash_attn) when no
+    mask is provided; falls back to SDPA only when a mask is required.
+
+    The official kernel (`flash_attn.flash_attn_varlen_func`) and PyTorch's SDPA can
+    produce slightly different bf16 outputs for identical Q/K/V due to different
+    block-wise softmax / accumulation orders. The trained Wan2.2 weights were calibrated
+    to flash_attn's numerics, so using SDPA introduces ~1e-2 per-block drift that
+    compounds catastrophically over 30 blocks × 50 denoising steps × CFG=5 amplification.
+    See Wan2.2/wan/modules/attention.py:24-130 for the official implementation.
+
+    Input shape:  [B, S, n*d]  (n=num_heads, d=head_dim)
+    Output shape: [B, S, n*d]
+    """
+    out_dtype = q.dtype
+
+    # Fast path: use flash_attn's varlen API for exact bit-equivalence with the official
+    # Wan2.2 forward. Only available when (a) flash_attn is installed and (b) no mask is
+    # provided (varlen handles per-batch lengths, not per-position masks).
+    if ctx_mask is None:
+        try:
+            from flash_attn import flash_attn_varlen_func
+        except ImportError:
+            flash_attn_varlen_func = None
+
+        if flash_attn_varlen_func is not None:
+            # Reshape to [B, S, n, d] (the official's expected input shape).
+            qh = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
+            kh = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
+            vh = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
+            b, lq = qh.shape[0], qh.shape[1]
+            lk = kh.shape[1]
+
+            # Cast to bf16 to match the official `half(...)` step. Flash attention's CUDA
+            # kernels require half precision (fp16 or bf16).
+            half_dtype = torch.bfloat16 if qh.dtype not in (torch.float16, torch.bfloat16) else qh.dtype
+            qf = qh.flatten(0, 1).to(half_dtype)
+            kf = kh.flatten(0, 1).to(half_dtype)
+            vf = vh.flatten(0, 1).to(half_dtype)
+
+            q_lens = torch.tensor([lq] * b, dtype=torch.int32, device=q.device)
+            k_lens = torch.tensor([lk] * b, dtype=torch.int32, device=q.device)
+            cu_seqlens_q = torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(0, dtype=torch.int32)
+            cu_seqlens_k = torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(0, dtype=torch.int32)
+
+            x = flash_attn_varlen_func(
+                q=qf, k=kf, v=vf,
+                cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=lq, max_seqlen_k=lk,
+                dropout_p=0.0, softmax_scale=None, causal=False,
+                window_size=(-1, -1), deterministic=False,
+            ).unflatten(0, (b, lq))
+            x = x.to(out_dtype)
+            return rearrange(x, "b s n d -> b s (n d)")
+
+    # Fallback: SDPA. Used when a mask is provided (cross-attention with context_mask)
+    # or when flash_attn is unavailable. Numerically diverges slightly from official.
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
@@ -595,7 +651,13 @@ class WanVideoDiT(torch.nn.Module):
                 )
             context_mask = context_mask.unsqueeze(1).expand(-1, f * h * w, -1) # (B, seq_len, L)
         else:
-            context_mask = context_mask.unsqueeze(1).expand(-1, f * h * w, -1) # (B, seq_len, L)
+            # Match official Wan2.2: cross-attention runs with NO mask (context_lens=None
+            # at model.py:472). The text_embedding of padded positions contributes small
+            # but non-zero K/V values, and the trained model expects to attend to them.
+            # Applying a mask here forces FastWAM's flash_attention wrapper down the SDPA
+            # fallback path (which diverges from flash_attn's bf16 numerics by ~1e-2 per
+            # block, compounding catastrophically over 30 blocks × 50 steps × CFG=5).
+            context_mask = None
 
         x_tokens = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
 
