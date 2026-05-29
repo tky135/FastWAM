@@ -108,13 +108,11 @@ class Wan22Trainer:
 
         self.checkpoint_root = os.path.join(self.output_dir, "checkpoints")
         self.weights_dir = os.path.join(self.checkpoint_root, "weights")
-        self.state_dir = os.path.join(self.checkpoint_root, "state")
         self.eval_dir = os.path.join(self.output_dir, "eval")
 
         ensure_dir(self.output_dir)
         ensure_dir(self.checkpoint_root)
         ensure_dir(self.weights_dir)
-        ensure_dir(self.state_dir)
         ensure_dir(self.eval_dir)
 
         self.model, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
@@ -582,16 +580,6 @@ class Wan22Trainer:
         model.save_checkpoint(ckpt_path, optimizer=None, step=self.global_step)
         return ckpt_path
 
-    def _save_trainer_state(self, state_path: str):
-        state_file = os.path.join(state_path, "trainer_state.json")
-        payload = {
-            "global_step": int(self.global_step),
-            "epoch": int(self.epoch),
-            "batch_in_epoch": int(self.batch_in_epoch),
-        }
-        with open(state_file, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=True, indent=2)
-
     def save_checkpoint(self):
         step_tag = f"step_{self.global_step:06d}"
 
@@ -601,14 +589,7 @@ class Wan22Trainer:
             ckpt_path = self._save_weights_checkpoint(step_tag=step_tag)
         self.accelerator.wait_for_everyone()
 
-        state_path = os.path.join(self.state_dir, step_tag)
-        ensure_dir(state_path)
-        self.accelerator.save_state(output_dir=state_path)
-        if self.accelerator.is_main_process:
-            self._save_trainer_state(state_path)
-        self.accelerator.wait_for_everyone()
-
-        return {"weights_path": ckpt_path, "state_path": state_path}
+        return {"weights_path": ckpt_path}
 
     def load_training_state(self, state_dir: str):
         self.accelerator.load_state(input_dir=state_dir)
@@ -793,29 +774,26 @@ class Wan22Trainer:
                         ckpt_info = self.save_checkpoint()
                         if self.accelerator.is_main_process:
                             logger.info(
-                                "[ckpt] step=%d weights=%s state=%s",
+                                "[ckpt] step=%d weights=%s",
                                 self.global_step,
                                 ckpt_info["weights_path"],
-                                ckpt_info["state_path"],
                             )
 
                     if self.global_step >= self.max_steps:
                         ckpt_info = self.save_checkpoint()
                         if self.accelerator.is_main_process:
                             logger.info(
-                                "[done] max_steps reached step=%d weights=%s state=%s",
+                                "[done] max_steps reached step=%d weights=%s",
                                 self.global_step,
                                 ckpt_info["weights_path"],
-                                ckpt_info["state_path"],
                             )
                         return
 
         ckpt_info = self.save_checkpoint()
         if self.accelerator.is_main_process:
             logger.info(
-                "[done] training finished step=%d weights=%s state=%s",
+                "[done] training finished step=%d weights=%s",
                 self.global_step,
                 ckpt_info["weights_path"],
-                ckpt_info["state_path"],
             )
         

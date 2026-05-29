@@ -595,7 +595,13 @@ class WanVideoDiT(torch.nn.Module):
                 )
             context_mask = context_mask.unsqueeze(1).expand(-1, f * h * w, -1) # (B, seq_len, L)
         else:
-            context_mask = context_mask.unsqueeze(1).expand(-1, f * h * w, -1) # (B, seq_len, L)
+            # Match official Wan2.2: cross-attention runs with NO mask (context_lens=None
+            # at model.py:472). The text_embedding of padded positions contributes small
+            # but non-zero K/V values, and the trained model expects to attend to them.
+            # Applying a mask here forces FastWAM's flash_attention wrapper down the SDPA
+            # fallback path (which diverges from flash_attn's bf16 numerics by ~1e-2 per
+            # block, compounding catastrophically over 30 blocks × 50 steps × CFG=5).
+            context_mask = None
 
         x_tokens = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
 
