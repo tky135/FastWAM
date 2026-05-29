@@ -1,0 +1,106 @@
+train:
+  _target_: fastwam.datasets.nuscenes.nuscenes_video_dataset.NuScenesDenseVideoDataset
+  dataroot: /root/autodl-tmp/nuscenes
+  version: v1.0-trainval
+  split: train
+  camera_key: CAM_FRONT
+  # Dense video (~12 Hz) + keyframe action (2 Hz). 48 future frames + 1 condition = 49
+  # video frames over the same 4 s window covered by 8 keyframe waypoints. (49-1)%4==0
+  # -> 13 latent frames, putting the video branch in-distribution for the Wan2.2 prior.
+  num_video_frames: 49           # T_video: 48 future @12Hz + 1 condition
+  num_action_steps: 8            # T_action: 8 waypoints @2Hz keyframes (= keyframe intervals)
+  video_frames_per_action: 6     # 12Hz/2Hz: keyframe + 5 sweeps per interval
+  strict_sweep_count: true       # drop anchors whose keyframes don't land at frames 0,6,...,48
+  shape_meta:
+    images:
+      - key: CAM_FRONT
+        raw_shape: [3, 900, 1600]
+        shape: [3, 704, 1280]
+    action:
+      - key: default
+        raw_shape: 3   # (dx, dy, dyaw) in anchor ego frame
+        shape: 3
+    state:
+      - key: default
+        raw_shape: 4   # (v_x, v_y, yaw_rate, speed) in ego frame
+        shape: 4
+  video_size: [704, 1280]        # native Wan2.2-TI2V-5B landscape; both divisible by 16
+  global_sample_stride: 1
+  is_training_set: true
+  skip_padding_as_possible: false
+  override_instruction: "Front-view driving scene from a moving vehicle."
+  processor:
+    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_video_frames}   # = 49: processor asserts image T == num_obs_steps
+    num_output_cameras: 1
+    action_output_dim: 3
+    proprio_output_dim: 4
+    delta_action_dim_mask: null
+    action_state_transforms: null
+    use_stepwise_action_norm: false
+    norm_default_mode: z-score
+    norm_exception_mode: null
+    action_state_merger:
+      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+    train_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [704, 1280]
+    val_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [704, 1280]
+  text_embedding_cache_dir: ./data/text_embeds_cache/nuscenes
+  context_len: 128
+  # When set, the normalization stats pass writes its result here on first run and loads
+  # from it on every subsequent run, skipping the CPU-only pass entirely. The dense cache
+  # key encodes num_action_steps/video_frames_per_action/strict/stride so it never
+  # collides with the 2 Hz keyframe caches. Delete manually if you change processor
+  # action/state transforms.
+  stats_cache_dir: ./data/dataset_stats_cache/nuscenes
+
+val:
+  _target_: fastwam.datasets.nuscenes.nuscenes_video_dataset.NuScenesDenseVideoDataset
+  dataroot: /root/autodl-tmp/nuscenes
+  version: v1.0-test
+  split: test
+  camera_key: ${data.train.camera_key}
+  num_video_frames: ${data.train.num_video_frames}
+  num_action_steps: ${data.train.num_action_steps}
+  video_frames_per_action: ${data.train.video_frames_per_action}
+  strict_sweep_count: ${data.train.strict_sweep_count}
+  shape_meta: ${data.train.shape_meta}
+  video_size: ${data.train.video_size}
+  global_sample_stride: 1
+  is_training_set: false
+  skip_padding_as_possible: false
+  override_instruction: ${data.train.override_instruction}
+  processor: ${data.train.processor}
+  text_embedding_cache_dir: ${data.train.text_embedding_cache_dir}
+  context_len: ${data.train.context_len}
+  pretrained_norm_stats: null   # runtime.build_datasets passes the actual path at instantiate time
+
+# Convenience block: combined mini_train + mini_val (all 10 v1.0-mini scenes), used as a
+# single dataset. Mirrors `train` so stats are computed on first init. Useful for the
+# dataset explorer (`--split mini`) and tiny smoke runs.
+mini:
+  _target_: fastwam.datasets.nuscenes.nuscenes_video_dataset.NuScenesDenseVideoDataset
+  dataroot: /root/autodl-fs/nuscenes
+  version: v1.0-mini
+  split: mini
+  camera_key: ${data.train.camera_key}
+  num_video_frames: ${data.train.num_video_frames}
+  num_action_steps: ${data.train.num_action_steps}
+  video_frames_per_action: ${data.train.video_frames_per_action}
+  strict_sweep_count: ${data.train.strict_sweep_count}
+  shape_meta: ${data.train.shape_meta}
+  video_size: ${data.train.video_size}
+  global_sample_stride: 1
+  is_training_set: true
+  skip_padding_as_possible: false
+  override_instruction: ${data.train.override_instruction}
+  processor: ${data.train.processor}
+  text_embedding_cache_dir: ${data.train.text_embedding_cache_dir}
+  context_len: ${data.train.context_len}
+  stats_cache_dir: ${data.train.stats_cache_dir}

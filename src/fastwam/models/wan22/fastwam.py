@@ -305,9 +305,17 @@ class FastWAM(torch.nn.Module):
         if action.ndim != 3:
             raise ValueError(f"`sample['action']` must be 3D [B, T, a_dim], got shape {tuple(action.shape)}")
         action_horizon = int(action.shape[1])
-        if action_horizon % (num_frames - 1) != 0:
+        # Action and video horizons are temporally DECOUPLED. The action expert builds
+        # its own RoPE from `action_horizon`, and the only video<->action coupling is
+        # action->first-video-frame attention (see `_build_mot_attention_mask`); nothing
+        # reshapes action into per-video-frame chunks. So any `action_horizon >= 1` is
+        # valid regardless of the video frame count. The old
+        # `action_horizon % (num_frames - 1) == 0` guard assumed one action per video
+        # transition — true for LIBERO/RoboTwin/keyframe-nuScenes (still satisfied), but
+        # false for dense-video nuScenes (T_video=49, T_action=8).
+        if action_horizon < 1:
             raise ValueError(
-                f"`sample['action']` temporal dimension must be divisible by video transitions ({num_frames - 1}), got {action_horizon}"
+                f"`sample['action']` temporal dimension must be >= 1, got {action_horizon}"
             )
 
         action_is_pad = sample.get("action_is_pad", None)

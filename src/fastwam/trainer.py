@@ -335,8 +335,13 @@ class Wan22Trainer:
                 action = action.unsqueeze(0)
             if action.ndim != 3:
                 raise ValueError(f"`sample['action']` must be 3D [B, T, a_dim], got shape {tuple(action.shape)}")
-            if action.shape[1] % (num_video_frames - 1) != 0:
-                raise ValueError(f"`sample['action']` temporal dimension must be divisible by video frames-1={num_video_frames - 1}, got {action.shape[1]}")
+            # Action and video horizons are temporally decoupled: `model.infer` derives
+            # `latent_t` from `num_video_frames` and `latents_action` from `action_horizon`
+            # independently, and handles arbitrary (T_video, T_action). The old
+            # divisibility guard assumed one action per video transition (still true for
+            # keyframe configs) but rejected dense-video nuScenes (T_video=49, T_action=8).
+            if action.shape[1] < 1:
+                raise ValueError(f"`sample['action']` temporal dimension must be >= 1, got {action.shape[1]}")
             action_horizon = int(action.shape[1])
 
         proprio = None

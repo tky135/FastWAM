@@ -772,6 +772,194 @@ class NuScenesVideoDataset(torch.utils.data.Dataset):
         return out_path
 
 
+class NuScenesDenseVideoDataset(NuScenesVideoDataset):
+    """Dense-video / keyframe-action nuScenes WAM dataset.
+
+    Same dict contract as the parent, but the VIDEO stream is sampled at the camera's
+    native ~12 Hz (walking the CAM_FRONT ``sample_data`` linked list, which includes
+    non-keyframe "sweeps") while ACTIONS and PROPRIO stay on the 2 Hz keyframe grid.
+    For the default config this yields:
+
+        video:   [C=3, T_video=49, H, W]   # frame 0 = anchor (condition); frames 1..48
+                                            # are ~12 Hz, spanning the same 4 s as the action
+        action:  [T_action=8, 3]            # 8 ego waypoints at 2 Hz keyframes
+        proprio: [T_action=8, 4]            # keyframe ego dynamics (model uses row 0 only)
+
+    Why dense video: Wan2.2-TI2V-5B is out-of-distribution at very few latent frames
+    (9 pixel frames -> 3 latent), producing poor video; 49 pixel frames -> 13 latent
+    matches its temporal prior far better.
+
+    Design: ``self.num_frames`` keeps the parent's "keyframe count" meaning (=9), so all
+    inherited keyframe/ego-pose math (``_compute_actions_and_state``, ``_compute_waypoints``,
+    ``_compute_proprio``) works unchanged. ``self.num_video_frames`` (=49) drives the dense
+    image walk. ``video_sample_indices`` is set to ``range(num_video_frames)`` so the
+    inherited ``_get`` passes every loaded frame through (identity slice).
+
+    With ``strict_sweep_count=True`` an anchor is kept only when its keyframes land exactly
+    on dense frames 0, K, 2K, ..., where K = ``video_frames_per_action`` (=6); anchors with
+    jitter/dropped sweeps are dropped so the video and action windows cover the identical
+    time span.
+    """
+
+    def __init__(
+        self,
+        *args,
+        num_video_frames: int = 49,
+        num_action_steps: int = 8,
+        video_frames_per_action: int = 6,
+        strict_sweep_count: bool = True,
+        **kwargs,
+    ):
+        if num_video_frames != num_action_steps * video_frames_per_action + 1:
+            raise ValueError(
+                "num_video_frames must equal num_action_steps * video_frames_per_action + 1, "
+                f"got {num_video_frames} != {num_action_steps} * {video_frames_per_action} + 1."
+            )
+        if (num_video_frames - 1) % 4 != 0:
+            raise ValueError(
+                f"(num_video_frames - 1) must be divisible by 4 for VAE tokenization, "
+                f"got num_video_frames={num_video_frames}."
+            )
+        # Set the dense-mode attributes BEFORE super().__init__(): the parent constructor
+        # calls the overridden `_build_sample_index` (which needs them) and the stats pass.
+        self.num_video_frames = int(num_video_frames)
+        self.num_action_steps = int(num_action_steps)
+        self.video_frames_per_action = int(video_frames_per_action)
+        self.num_keyframes = int(num_action_steps) + 1  # anchor + num_action_steps future
+        self.strict_sweep_count = bool(strict_sweep_count)
+        self._dense_sd_tokens: list[list[str]] = []
+
+        # Drive the inherited keyframe walks (action/proprio) off num_keyframes, and pick
+        # parameter values that satisfy the parent's VAE asserts untouched:
+        #   (num_keyframes-1) % 1 == 0  and  ((num_keyframes-1)//1) % 4 == 0  (8 % 4 == 0).
+        kwargs["num_frames"] = self.num_keyframes
+        kwargs["action_video_freq_ratio"] = 1
+        super().__init__(*args, **kwargs)
+
+        # Dense video keeps every loaded frame: replace the parent's range(0, 9, 1) with
+        # range(0, 49). The inherited `_get` uses this as a (now identity) subsample.
+        self.video_sample_indices = list(range(self.num_video_frames))
+        logger.info(
+            f"NuScenesDenseVideoDataset[{self.split}]: T_video={self.num_video_frames} "
+            f"T_action={self.num_action_steps} keyframes={self.num_keyframes} "
+            f"video_frames_per_action={self.video_frames_per_action} "
+            f"strict={self.strict_sweep_count} anchors={len(self.sample_tokens)}"
+        )
+
+    # ---- index construction (override) ----
+
+    def _build_sample_index(self, scene_names: list[str]) -> list[str]:
+        anchors: list[str] = []
+        self._dense_sd_tokens = []
+        n_total = 0
+        n_dropped = 0
+        for s in self.nusc.scene:
+            if s["name"] not in scene_names:
+                continue
+            tokens: list[str] = []
+            tok = s["first_sample_token"]
+            while tok:
+                tokens.append(tok)
+                tok = self.nusc.get("sample", tok)["next"]
+            # Need keyframes i..i+num_action_steps (= num_keyframes) and i>=1 (backward-diff
+            # proprio needs a prior keyframe). Last valid i = len(tokens)-1-num_action_steps.
+            max_anchor = len(tokens) - self.num_action_steps
+            if max_anchor <= 1:
+                continue
+            for i in range(1, max_anchor, self.global_sample_stride):
+                n_total += 1
+                dense = self._collect_dense_sd_tokens(tokens, i)
+                if dense is None:
+                    n_dropped += 1
+                    continue
+                anchors.append(tokens[i])
+                self._dense_sd_tokens.append(dense)
+        logger.info(
+            f"NuScenesDenseVideoDataset[{self.split}]: kept {len(anchors)}/{n_total} anchors "
+            f"({n_dropped} dropped for dense-sweep availability/alignment)"
+        )
+        return anchors
+
+    def _collect_dense_sd_tokens(
+        self, kf_tokens: list[str], start_idx: int
+    ) -> Optional[list[str]]:
+        """Return the ``num_video_frames`` CAM_FRONT sample_data tokens spanning keyframes
+        ``[start_idx .. start_idx+num_action_steps]``, or ``None`` if the dense chain runs
+        out in-scene or (in strict mode) the keyframes do not land at frames 0,K,2K,..."""
+        anchor_sd = self.nusc.get("sample", kf_tokens[start_idx])["data"][self.camera_key]
+        dense = self._walk_forward_sample_data(anchor_sd, self.num_video_frames - 1)
+        if dense is None:
+            return None
+        if self.strict_sweep_count:
+            K = self.video_frames_per_action
+            for k in range(self.num_action_steps + 1):
+                kf_sd = self.nusc.get("sample", kf_tokens[start_idx + k])["data"][
+                    self.camera_key
+                ]
+                if dense[k * K] != kf_sd:
+                    return None
+        return dense
+
+    # ---- nuScenes IO (dense) ----
+
+    def _walk_forward_sample_data(self, sd_token: str, n: int) -> Optional[list[str]]:
+        """Walk ``sample_data["next"]`` n times. Returns n+1 tokens (inclusive of start),
+        or ``None`` if the chain ends early (scene boundary)."""
+        out = [sd_token]
+        tok = sd_token
+        for _ in range(n):
+            nxt = self.nusc.get("sample_data", tok)["next"]
+            if not nxt:
+                return None
+            out.append(nxt)
+            tok = nxt
+        return out
+
+    def _load_image_from_sd(self, sd_token: str) -> torch.Tensor:
+        sd = self.nusc.get("sample_data", sd_token)
+        path = os.path.join(self.dataroot, sd["filename"])
+        with Image.open(path) as img:
+            arr = np.asarray(img.convert("RGB"), dtype=np.uint8)  # [H, W, 3]
+        return torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # [3, H, W]
+
+    # ---- raw sample (override) ----
+
+    def _build_raw_sample(self, idx: int) -> dict:
+        # Actions/proprio from the 9 keyframes (inherited); images from the 49 dense frames.
+        _, actions, proprio = self._compute_actions_and_state(idx)  # [8,3], [9,4]
+        sd_tokens = self._dense_sd_tokens[idx]
+        imgs = torch.stack(
+            [self._load_image_from_sd(t) for t in sd_tokens], dim=0
+        )  # [49, 3, H, W] uint8
+        return {
+            "images": {self.camera_key: imgs},
+            "action": {self._action_key: actions},
+            "state": {self._state_key: proprio},
+            "image_is_pad": torch.zeros(self.num_video_frames, dtype=torch.bool),  # 49
+            "action_is_pad": torch.zeros(self.num_action_steps, dtype=torch.bool),  # 8
+            "state_is_pad": torch.zeros(self.num_keyframes, dtype=torch.bool),  # 9
+            "task": self.override_instruction,
+            "idx": idx,
+        }
+
+    # ---- stats cache key (override) ----
+
+    def _stats_cache_path(self) -> Optional[str]:
+        if not self.stats_cache_dir:
+            return None
+        key = (
+            f"{self.version}"
+            f"__split-{self.split}"
+            f"__cam-{self.camera_key}"
+            f"__dense"
+            f"__nas{self.num_action_steps}"
+            f"__vfpa{self.video_frames_per_action}"
+            f"__strict{int(self.strict_sweep_count)}"
+            f"__st{self.global_sample_stride}"
+        )
+        return os.path.join(self.stats_cache_dir, f"{key}.json")
+
+
 if __name__ == "__main__":
     # Quick standalone explorer for NuScenesVideoDataset. Renders video strips and BEV
     # waypoint plots for a few samples so you can eyeball that the trajectory is
