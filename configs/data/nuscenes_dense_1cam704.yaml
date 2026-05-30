@@ -10,7 +10,10 @@ train:
   num_video_frames: 49           # T_video: 48 future @12Hz + 1 condition
   num_action_steps: 8            # T_action: 8 waypoints @2Hz keyframes (= keyframe intervals)
   video_frames_per_action: 6     # 12Hz/2Hz: keyframe + 5 sweeps per interval
-  strict_sweep_count: true       # drop anchors whose keyframes don't land at frames 0,6,...,48
+  strict_sweep_count: false      # loose: keep any anchor with 8 future keyframes + 48 future CAM frames
+                                 #   (no frame-for-frame video/action correspondence required).
+                                 #   true would additionally force keyframes onto dense idx 0,6,...,48
+                                 #   and drop ~3/4 of anchors to nuScenes ~12Hz camera jitter.
   shape_meta:
     images:
       - key: CAM_FRONT
