@@ -21,6 +21,7 @@ from .utils.pytorch_utils import set_global_seed
 from .utils.samplers import ResumableEpochSampler
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
+from .utils.action_metrics import open_loop_trajectory_metrics
 
 logger = get_logger(__name__)
 
@@ -441,8 +442,18 @@ class Wan22Trainer:
         psnr_rollout_vs_gt = video_psnr(pred=pred_video_tensor, target=gt_video_tensor)
         ssim_rollout_vs_gt = video_ssim(pred=pred_video_tensor, target=gt_video_tensor)
 
+        # LPIPS (rollout vs gt). Soft dependency: if `lpips` is not installed the metric
+        # is skipped with a warning so training never hard-depends on it.
+        lpips_rollout_vs_gt = None
+        try:
+            from .utils.perceptual_metrics import lpips_video
+            lpips_rollout_vs_gt = lpips_video(pred_video_tensor, gt_video_tensor, net="alex")
+        except Exception as exc:
+            logger.warning(f"LPIPS eval skipped ({exc!r}); `pip install lpips` to enable eval/lpips.")
+
         action_l1 = None
         action_l2 = None
+        traj_metrics = None
         if action is not None and pred_action is not None:
             if sample["proprio"] is None:
                 raise ValueError("Eval sample must contain `proprio` for action denormalization.")
@@ -496,6 +507,9 @@ class Wan22Trainer:
             action_l1 = action_diff.abs().mean().item()
             action_l2 = action_diff.pow(2).mean().item()
 
+            # Open-loop trajectory metrics (meters / radians) on the denormalized waypoints.
+            traj_metrics = open_loop_trajectory_metrics(pred_action_denorm[0], gt_action_denorm[0])
+
         # 4. VAE reconstruction metrics against GT video
         gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
         vae_latents = model._encode_video_latents(gt_video_batch, tiled=False)
@@ -540,6 +554,17 @@ class Wan22Trainer:
             except Exception as exc:
                 logger.warning(f"save_eval_visualization failed: {exc!r}")
 
+        def _sv(x):
+            # Sentinel-encode a scalar metric for the gather tensor: NaN/None/negative
+            # become -1.0 (all real metrics here are non-negative), so they can be masked
+            # out after gathering across ranks.
+            try:
+                v = float(x)
+            except (TypeError, ValueError):
+                return -1.0
+            return v if (v == v and v >= 0.0) else -1.0
+
+        traj = traj_metrics or {}
         local_metrics = torch.tensor(
             [
                 float(val_loss),
@@ -551,6 +576,14 @@ class Wan22Trainer:
                 float(ssim_decode_vs_gt),
                 float(action_l2) if action_l2 is not None else -1.0,
                 float(action_l1) if action_l1 is not None else -1.0,
+                _sv(traj.get("ade")),
+                _sv(traj.get("fde")),
+                _sv(traj.get("l2@1s")),
+                _sv(traj.get("l2@2s")),
+                _sv(traj.get("l2@3s")),
+                _sv(traj.get("l2@4s")),
+                _sv(traj.get("yaw_err")),
+                _sv(lpips_rollout_vs_gt),
             ],
             device=self.accelerator.device,
             dtype=torch.float32,
@@ -559,6 +592,20 @@ class Wan22Trainer:
         mean_metrics = gathered_metrics[:, :7].mean(dim=0)
         action_l2_mean = gathered_metrics[:, 7].mean().item() if action_l2 is not None else None
         action_l1_mean = gathered_metrics[:, 8].mean().item() if action_l1 is not None else None
+
+        def _masked_mean(col_idx):
+            col = gathered_metrics[:, col_idx]
+            valid = col >= 0
+            return float(col[valid].mean().item()) if bool(valid.any().item()) else None
+
+        traj_means = {
+            name: _masked_mean(idx)
+            for name, idx in (
+                ("ade", 9), ("fde", 10), ("l2@1s", 11), ("l2@2s", 12),
+                ("l2@3s", 13), ("l2@4s", 14), ("yaw_err", 15),
+            )
+        }
+        lpips_mean = _masked_mean(16)
 
         if was_dit_training:
             self._set_dit_only_train_mode()
@@ -577,6 +624,11 @@ class Wan22Trainer:
             result["action_l2"] = float(action_l2_mean)
         if action_l1_mean is not None:
             result["action_l1"] = float(action_l1_mean)
+        for name, value in traj_means.items():
+            if value is not None:
+                result[name] = float(value)
+        if lpips_mean is not None:
+            result["lpips"] = float(lpips_mean)
         return result
 
     def _save_weights_checkpoint(self, step_tag: str):
@@ -659,8 +711,10 @@ class Wan22Trainer:
         )
         if "action_l2" in metrics:
             description += " action_l2=%.4f" % metrics["action_l2"]
-        if "action_l1" in metrics:
-            description += " action_l1=%.4f" % metrics["action_l1"]
+        if "ade" in metrics:
+            description += " ade=%.3f fde=%.3f" % (metrics["ade"], metrics["fde"])
+        if "lpips" in metrics:
+            description += " lpips=%.4f" % metrics["lpips"]
         logger.info(description)
         eval_payload = {
             "eval/val_loss": float(metrics["val_loss"]),
@@ -671,10 +725,12 @@ class Wan22Trainer:
             "eval/psnr_dg": float(metrics["psnr_dg"]),
             "eval/ssim_dg": float(metrics["ssim_dg"]),
         }
-        if "action_l2" in metrics:
-            eval_payload["eval/action_l2"] = float(metrics["action_l2"])
-        if "action_l1" in metrics:
-            eval_payload["eval/action_l1"] = float(metrics["action_l1"])
+        # Open-loop action metrics + LPIPS (present when the eval sample has actions /
+        # when `lpips` is installed). FVD/FID are standalone-only (set-level metrics).
+        for key in ("action_l2", "action_l1", "ade", "fde",
+                    "l2@1s", "l2@2s", "l2@3s", "l2@4s", "yaw_err", "lpips"):
+            if key in metrics:
+                eval_payload[f"eval/{key}"] = float(metrics[key])
         self._wandb_log(eval_payload)
 
     def train(self):

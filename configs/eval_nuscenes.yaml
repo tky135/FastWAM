@@ -1,0 +1,47 @@
+# @package _global_
+#
+# Standalone nuScenes evaluation (video + ego-trajectory action) for a trained checkpoint.
+# Launch with accelerate for multi-GPU sharding, e.g.:
+#   accelerate launch --num_processes 2 experiments/nuscenes/eval_nuscenes.py \
+#     ckpt=<run>/checkpoints/weights/step_XXXXXX.pt eval.fvd.i3d_weights=/path/i3d_torchscript.pt
+
+defaults:
+  - train
+  - override /task: nuscenes_dense_uncond_1cam704_1e-4
+  - _self_
+
+ckpt: null
+
+model:
+  # The trained checkpoint provides all DiT/action weights via load_checkpoint, so skip the
+  # redundant base-pretrained loads. Text encoder stays off — we use the dataset's cached context.
+  skip_dit_load_from_pretrain: true
+  action_dit_pretrained_path: null
+
+eval:
+  num_samples: 512            # seeded subset; -1 (or 0) => full split
+  num_inference_steps: 30
+  text_cfg_scale: 1.0         # joint infer has no CFG; kept for parity / future use
+  sigma_shift: null
+  seed: 42
+  tiled: true                 # tiled VAE encode/decode (704x1280 x 49 frames is heavy)
+  compute_vae_recon: true     # adds psnr_dg/ssim_dg (vae vs gt) + psnr_rd/ssim_rd (rollout vs vae)
+  compute_fid: true
+  compute_fvd: true
+  lpips_net: alex             # 'alex' (fast) or 'vgg'
+  fid_frame_stride: 1         # subsample frames for FID to cut Inception forwards
+  fps: 8                      # saved sample mp4 fps
+  save_n_videos: 8            # rank-0 dumps this many stitched (pred|vae|gt) mp4s + BEV plots
+  device: cuda
+  dataset_stats_path: null    # default: auto-resolve dataset_stats.json from the ckpt's parents
+  output_dir: ./evaluate_results/nuscenes/${now:%Y%m%d_%H%M%S}
+  fvd:
+    backend: i3d              # 'i3d' (paper-comparable, requires weights) or 'r3d' (offline fallback)
+    i3d_weights: null         # required for backend=i3d: path to StyleGAN-V i3d_torchscript.pt
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null
