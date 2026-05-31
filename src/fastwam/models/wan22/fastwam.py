@@ -38,11 +38,18 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        video_attends_action: bool = False,
     ):
         super().__init__()
         self.video_expert = video_expert
         self.action_expert = action_expert
         self.mot = mot
+        # When True, future video tokens (video[1:]) attend to the action latents in the
+        # MoT mixed attention -> p(v_{1:} | a, c). This routes the video loss into the
+        # action expert (auxiliary supervision for the policy). The condition frame
+        # (video[0]) and the action's own attention are untouched, so the action stays
+        # p(a | c) and `infer_action` remains video-free. See `_build_mot_attention_mask`.
+        self.video_attends_action = bool(video_attends_action)
         # Keep trainer compatibility: optimizer and freeze logic use `model.dit`.
         self.dit = self.mot
 
@@ -111,6 +118,7 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        video_attends_action: bool = False,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -168,6 +176,7 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            video_attends_action=video_attends_action,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -412,6 +421,16 @@ class FastWAM(torch.nn.Module):
         # action -> first-frame video only
         first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
         mask[video_seq_len:, :first_frame_tokens] = True
+        # (optional) future video -> action: video[1:] tokens attend to the action latents,
+        # i.e. p(v_{1:} | a, c). This is the auxiliary-supervision experiment — it sends the
+        # video loss into the action expert. The condition frame video[0] is excluded (rows
+        # start at first_frame_tokens), and action attention is unchanged, so the action stays
+        # p(a | c). For action-only inference (video_seq_len == first_frame_tokens) this slice
+        # is empty -> no-op. NOTE: this adds no new parameters; the action keys are a small
+        # fraction of video[1:]'s keys so the pretrained prior is only mildly perturbed at init.
+        # If unstable, add a learnable zero-init gate on the action-key logits here.
+        if getattr(self, "video_attends_action", False):
+            mask[first_frame_tokens:video_seq_len, video_seq_len:] = True
         return mask
 
     def _compute_video_loss_per_sample(

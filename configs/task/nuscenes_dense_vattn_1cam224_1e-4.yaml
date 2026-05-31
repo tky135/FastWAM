@@ -1,0 +1,35 @@
+# @package _global_
+#
+# Experiment: future video attends to action latents (auxiliary supervision for the policy).
+# Identical to nuscenes_dense_uncond_1cam704_1e-4 but flips model.video_attends_action=true,
+# so video[1:] tokens attend to the action latents in the MoT (p(v_{1:}|a,c)) and the video
+# loss backprops into the action expert. The action stays p(a|c) (infer_action unchanged).
+
+defaults:
+  - override /data: nuscenes_dense_1cam224
+  - override /model: fastwam
+  - _self_
+
+# dataloading
+batch_size: 1            # 49 frames @ 704x1280 = 11,440 video tokens/sample; keep at 1
+num_workers: 8           # 49 JPEG decodes/sample (~5.4x the keyframe path) -> keep high
+
+model:
+  # 11,440 video tokens -> O(N^2) MoT self-attention; checkpoint the mixed-attn blocks.
+  mot_checkpoint_mixed_attn: true
+  # THE experiment knob: future video[1:] tokens attend to action latents.
+  video_attends_action: true
+
+# scheduler
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 5
+max_steps: null
+log_every: 10
+save_every: 5000
+eval_every: 200
+
+# training
+gradient_accumulation_steps: 4
+weight_decay: 1e-2
+resume: null

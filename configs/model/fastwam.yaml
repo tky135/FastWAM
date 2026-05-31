@@ -6,6 +6,11 @@ load_text_encoder: false
 proprio_dim: ${data.train.processor.proprio_output_dim}
 redirect_common_files: true
 mot_checkpoint_mixed_attn: true
+# Auxiliary-supervision experiment: when true, future video tokens (video[1:]) attend to
+# the action latents in the MoT (p(v_{1:}|a,c)), routing the video loss into the action
+# expert. Default false preserves the Independent p(a|c)p(v|c) behavior. The action stays
+# p(a|c) and infer_action is unaffected either way.
+video_attends_action: false
 action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
 skip_dit_load_from_pretrain: false
 
