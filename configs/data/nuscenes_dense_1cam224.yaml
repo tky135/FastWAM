@@ -18,7 +18,7 @@ train:
     images:
       - key: CAM_FRONT
         raw_shape: [3, 900, 1600]
-        shape: [3, 704, 1280]
+        shape: [3, 224, 384]
     action:
       - key: default
         raw_shape: 3   # (dx, dy, dyaw) in anchor ego frame
@@ -27,7 +27,7 @@ train:
       - key: default
         raw_shape: 4   # (v_x, v_y, yaw_rate, speed) in ego frame
         shape: 4
-  video_size: [704, 1280]        # native Wan2.2-TI2V-5B landscape; both divisible by 16
+  video_size: [224, 384]         # downscaled for the action+speed study; both divisible by 16 (224=16*14, 384=16*24)
   global_sample_stride: 1
   is_training_set: true
   skip_padding_as_possible: false
@@ -49,11 +49,11 @@ train:
     train_transforms:
       - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
-        size: [704, 1280]
+        size: [224, 384]
     val_transforms:
       - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
-        size: [704, 1280]
+        size: [224, 384]
   text_embedding_cache_dir: ./data/text_embeds_cache/nuscenes
   context_len: 128
   # When set, the normalization stats pass writes its result here on first run and loads

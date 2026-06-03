@@ -7,7 +7,7 @@
 
 defaults:
   - train
-  - override /task: nuscenes_dense_uncond_1cam704_1e-4
+  - override /task: nuscenes_dense_uncond_1cam224_1e-4
   - _self_
 
 ckpt: null
@@ -27,8 +27,8 @@ eval:
   text_cfg_scale: 1.0         # joint infer has no CFG; kept for parity / future use
   sigma_shift: null
   seed: 42
-  tiled: true                 # tiled VAE DECODE (704x1280 x 49 frames is heavy); encode is
-                              # always non-tiled (this VAE has no tiled-encode). No-op in action_only.
+  tiled: false                # at 224x384 the latent (14x24) is smaller than a tile, so tiled
+                              # VAE decode is a no-op; encode is always non-tiled. No-op in action_only.
   compute_vae_recon: true     # adds psnr_dg/ssim_dg (vae vs gt) + psnr_rd/ssim_rd (rollout vs vae)
   compute_fid: true
   compute_fvd: true

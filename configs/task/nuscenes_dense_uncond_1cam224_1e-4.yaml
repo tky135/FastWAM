@@ -1,17 +1,18 @@
 # @package _global_
 
 defaults:
-  - override /data: nuscenes_dense_1cam704
+  - override /data: nuscenes_dense_1cam224
   - override /model: fastwam
   - _self_
 
 # dataloading
-batch_size: 1            # 49 frames @ 704x1280 = 11,440 video tokens/sample; keep at 1
+batch_size: 1            # 49 frames @ 224x384 = ~1,092 video tokens/sample
 num_workers: 8           # 49 JPEG decodes/sample (~5.4x the keyframe path) -> keep high
 
 model:
-  # 11,440 video tokens -> O(N^2) MoT self-attention; checkpoint the mixed-attn blocks.
-  mot_checkpoint_mixed_attn: true
+  # ~1,092 video tokens at 224x384 -> O(N^2) MoT attention is cheap; no gradient
+  # checkpointing needed (matches the small-res libero configs).
+  mot_checkpoint_mixed_attn: false
 
 # scheduler
 lr_scheduler_type: "cosine"
