@@ -241,10 +241,12 @@ class FastWAM(torch.nn.Module):
 
     @torch.no_grad()
     def _encode_video_latents(self, video_tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
+        # This VAE supports tiled DECODE but not tiled ENCODE (vae.encode raises on tiled=True).
+        # Encoding is therefore always non-tiled, regardless of the caller's `tiled` flag.
         z = self.vae.encode(
             video_tensor,
             device=self.device,
-            tiled=tiled,
+            tiled=False,
             tile_size=tile_size,
             tile_stride=tile_stride,
         )
@@ -259,7 +261,8 @@ class FastWAM(torch.nn.Module):
                 f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
             )
         image = input_image.to(device=self.device)[0].unsqueeze(1)
-        z = self.vae.encode([image], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        # Tiled ENCODE is unsupported by this VAE (raises); always encode non-tiled.
+        z = self.vae.encode([image], device=self.device, tiled=False, tile_size=tile_size, tile_stride=tile_stride)
         if isinstance(z, list):
             z = z[0].unsqueeze(0)
         return z
