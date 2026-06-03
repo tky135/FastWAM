@@ -12,16 +12,29 @@ sharded across GPUs:
                       that matters at deployment for the uncond model, which never needs
                       to generate the video.
 
-The video branch is NOT action-conditioned (`action_conditioned: false`), so this is
-open-loop by construction — we pass `action=None` to `infer_joint` (no GT-trajectory
-leak). FVD/FID are aggregated from streaming Gaussian sufficient statistics so the run
-scales to the full set without all-gathering the feature matrices.
+The eval is RELATION-AWARE: it auto-detects which of the four action<->video relations the
+loaded checkpoint implements and labels/routes metrics accordingly. All four are evaluated
+through `infer_joint(action=None)` (no GT-trajectory leak) and return {video, action}; what
+differs is the model's internal action<->video coupling and which metric is the headline:
+  - uncond  : p(a|c) p(v|c)     independent           -> video + action both meaningful
+  - forward : p(v|a,c) (vattn)  video attends the     -> video + action both meaningful
+                                jointly-denoised action
+  - joint   : p(a,v|c)          action attends all video -> video + action both meaningful
+  - idm     : p(a|v,c)          action inferred from the  -> ACTION primary; video is the
+                                stage-1 self-generated video   stage-1 gen, diagnostic only
+NOTE: no current checkpoint conditions video on an externally-supplied GT action — the video
+DiT has `action_conditioned: false`, so the `action` arg to infer_joint is inert for it (see
+wan_video_dit.py: `action` is consumed only when `action_conditioned`). The forward relation's
+coupling is purely to the model's own denoised action latents in the MoT mixed attention, so
+it too is evaluated with `action=None`. FVD/FID are aggregated from streaming Gaussian
+sufficient statistics so the run scales to the full set without all-gathering features.
 
-Set `eval.action_only=true` to evaluate ONLY the trajectory: the predicted action comes
-straight from the video-free `model.infer_action`, and ALL video generation + video
-metrics (PSNR/SSIM/LPIPS/FID/FVD, VAE recon, mp4s) are skipped. This is the deployment
-mode for the uncond model — far faster and lighter (no full-video MoT, no VAE decode) —
-and only ADE/FDE/L2/yaw + the action-only latency/memory are produced.
+Set `eval.action_only=true` to evaluate ONLY the trajectory via `model.infer_action`; ALL
+video generation + video metrics (PSNR/SSIM/LPIPS/FID/FVD, VAE recon, mp4s) are skipped. For
+uncond/forward this is the video-free deployment path (no full-video MoT, no VAE decode) and
+far faster/lighter; for joint/idm `infer_action` co-denoises the video internally (same cost),
+so action_only there just suppresses video metrics. Only ADE/FDE/L2/yaw + action timing/memory
+are produced. Override auto-detection with `eval.relation=<uncond|forward|joint|idm>`.
 
 Runs on a single 96GB GPU (peak ~30-45GB worst case for the full path, ~15GB action-only;
 weights ~13GB + transient + aux metric models). Multi-GPU sharding is optional.
@@ -64,6 +77,9 @@ project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+from fastwam.models.wan22.fastwam import FastWAM
+from fastwam.models.wan22.fastwam_idm import FastWAMIDM
+from fastwam.models.wan22.fastwam_joint import FastWAMJoint
 from fastwam.utils.action_metrics import open_loop_trajectory_metrics
 from fastwam.utils.logging_config import get_logger
 from fastwam.utils.perceptual_metrics import (
@@ -88,6 +104,37 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 ACTION_KEYS = ["ade", "fde", "l2@1s", "l2@2s", "l2@3s", "l2@4s", "yaw_err"]
 VIDEO_SCALAR_KEYS = ["psnr_rg", "ssim_rg", "psnr_rd", "ssim_rd", "psnr_dg", "ssim_dg", "lpips"]
+
+# The four action<->video relations -> (label written to metrics.json, headline metric family).
+# `action_only_is_video_free`: True only when model.infer_action skips the full-video MoT (the
+# deployment fast-path); for joint/idm it co-denoises the video, so it is no cheaper than full.
+RELATION_META = {
+    "uncond":  {"action_conditioning": "independent",          "primary_metric": "video+action", "action_only_is_video_free": True},
+    "forward": {"action_conditioning": "video_attends_action", "primary_metric": "video+action", "action_only_is_video_free": True},
+    "joint":   {"action_conditioning": "joint",                "primary_metric": "video+action", "action_only_is_video_free": False},
+    "idm":     {"action_conditioning": "inverse_dynamics",     "primary_metric": "action",        "action_only_is_video_free": False},
+}
+
+
+def detect_relation(model, cfg) -> str:
+    """Which of the four action<->video relations this checkpoint implements.
+
+    Auto-detected from the model class (+ the `video_attends_action` flag for the base
+    FastWAM). Override with `eval.relation=<uncond|forward|joint|idm>` if needed.
+    """
+    override = cfg.eval.get("relation", None)
+    if override is not None:
+        rel = str(override)
+        if rel not in RELATION_META:
+            raise ValueError(f"eval.relation={rel!r} not in {sorted(RELATION_META)}")
+        return rel
+    if isinstance(model, FastWAMIDM):        # subclass of FastWAMJoint -> must be checked first
+        return "idm"
+    if isinstance(model, FastWAMJoint):
+        return "joint"
+    if getattr(model, "video_attends_action", False):
+        return "forward"
+    return "uncond"
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -288,6 +335,15 @@ def main(cfg: DictConfig):
     model.load_checkpoint(str(cfg.ckpt))
     model = model.to(device).eval()
 
+    relation = detect_relation(model, cfg)
+    rel_meta = RELATION_META[relation]
+    action_is_video_free = bool(rel_meta["action_only_is_video_free"])
+    if is_main:
+        logger.info(
+            "action<->video relation: %s (conditioning=%s, primary=%s, action_only_video_free=%s)",
+            relation, rel_meta["action_conditioning"], rel_meta["primary_metric"], action_is_video_free,
+        )
+
     # Inference timing/memory baselines. cudnn.benchmark is safe here (per-sample input
     # shapes are fixed: 704x1280 x 49 frames), so conv autotune runs once on sample 0.
     mem_weights = 0
@@ -363,23 +419,29 @@ def main(cfg: DictConfig):
         action_horizon = int(action_gt.shape[0])
         row = {"idx": int(idx), "warmup": bool(i < timing_warmup)}
 
-        # ---- video-free action-only inference (deployment path for the uncond model) ----
-        # infer_action encodes ONLY the condition frame + one first-frame KV prefill, then
-        # denoises the action against cached video K/V: NO full-video MoT, NO VAE decode.
+        # ---- action-only inference (video-free deployment path for uncond/forward) ----
+        # For uncond/forward, infer_action encodes ONLY the condition frame + one first-frame KV
+        # prefill, then denoises the action against cached video K/V: NO full-video MoT, NO VAE
+        # decode. For joint/idm it co-denoises the video internally (see num_video_frames below).
         def _run_action():
+            action_kwargs = dict(
+                prompt=None,
+                input_image=video[:, 0].unsqueeze(0),
+                action_horizon=action_horizon,
+                proprio=proprio[0],
+                context=sample["context"],
+                context_mask=sample["context_mask"],
+                num_inference_steps=num_steps,
+                sigma_shift=sigma_shift,
+                seed=seed,
+                tiled=tiled,
+            )
+            # Joint/IDM infer_action co-denoise the video, so their signature requires the
+            # frame count; base FastWAM.infer_action (uncond/forward) is video-free and rejects it.
+            if not action_is_video_free:
+                action_kwargs["num_video_frames"] = num_frames
             with torch.no_grad():
-                return model.infer_action(
-                    prompt=None,
-                    input_image=video[:, 0].unsqueeze(0),
-                    action_horizon=action_horizon,
-                    proprio=proprio[0],
-                    context=sample["context"],
-                    context_mask=sample["context_mask"],
-                    num_inference_steps=num_steps,
-                    sigma_shift=sigma_shift,
-                    seed=seed,
-                    tiled=tiled,
-                )
+                return model.infer_action(**action_kwargs)
 
         if action_only:
             # Video-free evaluation: run + score ONLY the action; the predicted trajectory
@@ -425,19 +487,18 @@ def main(cfg: DictConfig):
             pred_video = pred["video"]      # list[PIL]
             pred_action = pred["action"]    # [Ta, 3] normalized, cpu
 
-            # Also time the video-free path alongside the full one, so (full - action) isolates
-            # the video-generation cost.
-            if measure_timing and timing_action_only:
+            # Also time the video-free action path alongside the full one, so (full - action)
+            # isolates the video-generation cost. Only meaningful for uncond/forward, whose
+            # infer_action skips the full-video MoT; for joint/idm infer_action co-denoises the
+            # video (same cost as full), so the difference is ~0 and not a real deployment speedup.
+            if measure_timing and timing_action_only and action_is_video_free:
                 try:
                     _, t_action, mem_action = _timed_call(_run_action, device)
                     row["t_action"] = round(t_action, 5)
                     row["mem_action"] = mem_action
                 except Exception as exc:
                     if is_main and i == 0:
-                        logger.warning(
-                            "Video-free action-only timing disabled: model.infer_action failed (%r). "
-                            "(Expected for Joint/IDM variants whose infer_action co-denoises video.)", exc
-                        )
+                        logger.warning("Video-free action-only timing disabled: model.infer_action failed (%r).", exc)
                     timing_action_only = False
 
         # ---- action metrics ----
@@ -565,7 +626,9 @@ def main(cfg: DictConfig):
         "num_inference_steps": int(cfg.eval.get("num_inference_steps", 30)),
         "text_cfg_scale": float(cfg.eval.get("text_cfg_scale", 1.0)),
         "mode": "action_only" if action_only else "full",
-        "action_conditioning": "open_loop",
+        "relation": relation,
+        "primary_metric": rel_meta["primary_metric"],
+        "action_conditioning": rel_meta["action_conditioning"],
         "fvd_backend": (fvd_backend if (not action_only and fvd_val is not None) else None),
         "fid_frame_stride": fid_stride,
         "action": {k: _nanmean(all_rows, k) for k in ACTION_KEYS},
