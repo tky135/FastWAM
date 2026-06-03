@@ -19,12 +19,16 @@ model:
   action_dit_pretrained_path: null
 
 eval:
+  action_only: false          # video-free: score ONLY the trajectory via infer_action,
+                              # skipping all video generation + video metrics (PSNR/SSIM/
+                              # LPIPS/FID/FVD/VAE-recon/mp4). Deployment mode for the uncond model.
   num_samples: 512            # seeded subset; -1 (or 0) => full split
   num_inference_steps: 30
   text_cfg_scale: 1.0         # joint infer has no CFG; kept for parity / future use
   sigma_shift: null
   seed: 42
-  tiled: true                 # tiled VAE encode/decode (704x1280 x 49 frames is heavy)
+  tiled: true                 # tiled VAE DECODE (704x1280 x 49 frames is heavy); encode is
+                              # always non-tiled (this VAE has no tiled-encode). No-op in action_only.
   compute_vae_recon: true     # adds psnr_dg/ssim_dg (vae vs gt) + psnr_rd/ssim_rd (rollout vs vae)
   compute_fid: true
   compute_fvd: true
@@ -32,8 +36,13 @@ eval:
   fid_frame_stride: 1         # subsample frames for FID to cut Inception forwards
   fps: 8                      # saved sample mp4 fps
   save_n_videos: 8            # rank-0 dumps this many stitched (pred|vae|gt) mp4s + BEV plots
-  device: cuda
+  device: null                # default: accelerate per-rank device (cuda:0 on 1 GPU); set to override
   dataset_stats_path: null    # default: auto-resolve dataset_stats.json from the ckpt's parents
+
+  # --- inference timing + peak GPU memory (reported in metrics.json under "timing") ---
+  measure_timing: true        # per-sample latency + peak mem, with torch.cuda.synchronize() barriers
+  timing_warmup: 1            # exclude first N samples/rank from stats (cuDNN autotune + allocator warmup)
+  timing_action_only: true    # also time model.infer_action -> latency WITHOUT generating the video
   output_dir: ./evaluate_results/nuscenes/${now:%Y%m%d_%H%M%S}
   fvd:
     backend: i3d              # 'i3d' (paper-comparable, requires weights) or 'r3d' (offline fallback)
