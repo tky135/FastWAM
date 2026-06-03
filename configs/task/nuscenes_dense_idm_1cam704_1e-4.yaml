@@ -1,0 +1,37 @@
+# @package _global_
+#
+# IDM relation p(a|v,c): action is inferred from video (FastWAMIDM, teacher-forcing video
+# conditioning -> at inference, video is denoised in a standalone stage 1, then the action is
+# denoised against that video's K/V). Matched to nuscenes_dense_uncond_1cam704_1e-4 in
+# EVERYTHING except `override /model` (fastwam_idm), so a 4-way action<->video relation
+# comparison differs only in the MoT attention structure.
+#
+# IDM teacher-forcing REQUIRES token-wise t_mod, i.e. video_dit_config.seperated_timestep=true
+# and fuse_vae_embedding_in_latents=true. configs/model/fastwam_idm.yaml already sets both.
+
+defaults:
+  - override /data: nuscenes_dense_1cam704
+  - override /model: fastwam_idm
+  - _self_
+
+# dataloading
+batch_size: 1            # 49 frames @ 704x1280 = 11,440 video tokens/sample; keep at 1
+num_workers: 8           # 49 JPEG decodes/sample (~5.4x the keyframe path) -> keep high
+
+model:
+  # 11,440 video tokens -> O(N^2) MoT self-attention; checkpoint the mixed-attn blocks.
+  mot_checkpoint_mixed_attn: true
+
+# scheduler
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 5
+max_steps: null
+log_every: 10
+save_every: 5000
+eval_every: 200
+
+# training
+gradient_accumulation_steps: 4
+weight_decay: 1e-2
+resume: null
