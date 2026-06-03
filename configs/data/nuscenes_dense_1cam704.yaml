@@ -66,11 +66,8 @@ train:
 val:
   _target_: fastwam.datasets.nuscenes.nuscenes_video_dataset.NuScenesDenseVideoDataset
   dataroot: /root/autodl-tmp/nuscenes
-  # Official nuScenes val split (150 scenes from v1.0-trainval). MUST NOT be v1.0-test:
-  # the test set ships without ego_pose, so GT trajectories (and thus every action metric
-  # ADE/FDE/L2/yaw) are unavailable there. Resolves via dataset `split=='val'` -> "val".
-  version: v1.0-trainval
-  split: val
+  version: v1.0-test
+  split: test
   camera_key: ${data.train.camera_key}
   num_video_frames: ${data.train.num_video_frames}
   num_action_steps: ${data.train.num_action_steps}
